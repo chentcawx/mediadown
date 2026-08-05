@@ -1,0 +1,3 @@
+- mediadown: Tauri v2 (multi-webview, unstable) + Rust + 原生 JS UI 的 MSE 媒体下载器。
+- 能播就能下
+- 需要在tools里放ffmpeg.exe 也可以使用mkvmerge.exe FF的效果更好。
