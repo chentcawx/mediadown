@@ -1,0 +1,1 @@
+mkvmerge.exe -o "%~dpn1.mkv" %*
