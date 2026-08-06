@@ -10,6 +10,14 @@ use tauri::Emitter;
 pub type TrackId = u32;
 pub type DirectId = u64;
 
+/// 当前 Unix 时间戳（毫秒），用于连播场景按注册时间最近配对音视频轨。
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// 轨道（视频 / 音频 / 字幕）
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TrackInfo {
@@ -28,6 +36,7 @@ pub struct TrackInfo {
     pub muxed: bool,         // 是否已参与 mkvmerge 混流（避免重复触发）
     pub mime_family: String, // mp4 | webm | other（决定收尾方式）
     pub title: String,       // 来源页面标题，作为默认文件名
+    pub registered_at: u64,  // 注册时刻(ms)，连播场景用于按时间最近配对音视频轨
 }
 
 /// 正在落盘的轨道句柄
@@ -191,9 +200,13 @@ impl AppState {
             if me.kind != "video" && me.kind != "audio" {
                 return;
             }
+            // 连播/下一集场景：同标题可能有多段(video/audio 各多个)，
+            // 仅按 title 配对会错配跨段轨道(V1 配 A2)；改为在「同标题+异 kind+
+            // 均已 finalized+未 muxed」候选中，选 registered_at 与 me 最接近者
+            // （同一段视频的 V/A 几乎同时注册，相差毫秒级；跨段至少隔一个播放间隔）。
             let partner = ts
                 .iter()
-                .find(|t| {
+                .filter(|t| {
                     t.id != id
                         && t.kind != me.kind
                         && (t.kind == "video" || t.kind == "audio")
@@ -201,6 +214,7 @@ impl AppState {
                         && !t.muxed
                         && t.title == me.title
                 })
+                .min_by_key(|t| t.registered_at.abs_diff(me.registered_at))
                 .cloned();
             match partner {
                 Some(p) => Some((me, p)),
@@ -345,9 +359,15 @@ impl AppState {
         drop(seq);
         {
             let mut ts = self.tracks.lock().unwrap();
-            if let Some(t) = ts.iter_mut().find(|t| t.mime == mime && t.kind == kind && !t.ended) {
-                return t.id; // 未结束的同轨复用
+            // 仅复用真正空轨(bytes==0 && segments==0)，否则必建新轨。
+            // 防止连播/下一集站点不发 endOfStream 时，第二段音频静默复用第一段
+            // 音频轨的 trackId，导致两段内容拼进同一 .m4a —— UI 看似"音频停滞"、mkv 配对跨段错配。
+            if let Some(t) = ts.iter_mut().find(|t| {
+                t.mime == mime && t.kind == kind && !t.ended && t.bytes == 0 && t.segments == 0
+            }) {
+                return t.id; // 空轨复用（仅限同 entry 残留的空轨）
             }
+            let registered_at = now_ms();
             ts.push(TrackInfo {
                 id,
                 kind: kind.into(),
@@ -364,6 +384,7 @@ impl AppState {
                 muxed: false,
                 mime_family: mime_family.into(),
                 title: title.into(),
+                registered_at,
             });
         }
         if auto {

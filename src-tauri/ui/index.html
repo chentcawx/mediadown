@@ -179,6 +179,8 @@
   .badge.text { background: rgba(245,166,35,.18); color: var(--orange); }
   .badge.direct { background: rgba(52,199,123,.18); color: var(--green); }
   .id { color: var(--text-faint); font-size: 11px; }
+  .ext { color: var(--accent); font-size: 11px; font-weight: 700; margin-left: 2px; flex-shrink: 0; }
+  .track-id { color: var(--text-faint); font-size: 11px; margin-left: 4px; }
   .state {
     font-size: 11px; margin-left: auto; font-weight: 600; flex-shrink: 0;
   }
@@ -642,13 +644,15 @@
         var trLbl = tr.finalized ? "完成" : (tr.finalizing ? "收尾中" : "下载中");
         var trCls = tr.finalized ? "done" : (tr.finalizing ? "fin" : "dl");
         var trName = tr.title ? tr.title : (tr.kind + "_" + tr.id);
+        var trExt = tr.kind === "audio" ? ".m4a" : ".mp4";
         html += '<div class="item">'
           + '<div class="item-top">'
           + '<span class="badge ' + tr.kind + '">' + kindLabel(tr.kind) + '</span>'
-          + '<span class="id">' + shortUrl(trName, 22) + '</span>'
+          + '<span class="id" title="' + escapeAttr(trName + trExt) + '">' + shortUrl(trName, 18) + '</span>'
+          + '<span class="ext">' + trExt + '</span>'
           + '<span class="state ' + trCls + '">' + trLbl + '</span>'
           + '</div>'
-          + '<div class="meta">' + fmtBytes(trBytes) + ' · ' + tr.segments + ' 分片</div>'
+          + '<div class="meta">' + fmtBytes(trBytes) + ' · ' + tr.segments + ' 分片 · 轨 #' + tr.id + '</div>'
           + (tr.finalized && tr.outPath ? '<div class="url">✓ ' + shortUrl(tr.outPath, 60) + '</div>' : "")
           + (tr.downloading ? '<div class="ops"><button class="mini danger" data-act="stop" data-id="' + tr.id + '">停止</button></div>' : "")
           + '</div>';

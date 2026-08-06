@@ -22,11 +22,19 @@
   let __mdtRegistered = 0;   // 已注册的轨道数（诊断用）
 
   // ---------------- 自发现 ----------------
+  // discover: scan 127.0.0.1:49321~49330 once; if no hit, retry every 3s until cfg is set.
+  // (startup race / transient server-not-ready would otherwise leave hook stuck "un-injected".)
+  let discoverActive = false;
   function discover() {
-    if (cfg) return;
-    let i = 0;
-    function tryPort() {
-      if (cfg) return;
+    if (cfg || discoverActive) return;
+    discoverActive = true;
+    function scan(i) {
+      if (cfg) { discoverActive = false; return; }
+      if (i >= 10) {
+        // whole round failed -> retry after 3s (loop stays active)
+        setTimeout(scan, 3000, 0);
+        return;
+      }
       const port = 49321 + i;
       nativeFetch("http://127.0.0.1:" + port + "/cfg", { cache: "no-store" })
         .then(function (r) {
@@ -35,19 +43,16 @@
         .then(function (c) {
           if (c && c.app === "mediadown") {
             cfg = c;
+            discoverActive = false;
             applyRateToAll();
             applyCopyUnlock();
           } else {
-            next();
+            scan(i + 1);
           }
         })
-        .catch(next);
-      i++;
-      function next() {
-        if (i < 10) tryPort();
-      }
+        .catch(function () { scan(i + 1); });
     }
-    tryPort();
+    scan(0);
   }
   // 配置刷新（enabled / rate 变化）
   function refreshConfig() {
