@@ -25,3 +25,5 @@ MediaDown-x64.exe
 .DS_Store
 Thumbs.db
 *.log
+# Archive of old builds and temp files
+archive/
