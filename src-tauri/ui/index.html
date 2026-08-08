@@ -197,6 +197,7 @@
     color: var(--text); border-radius: 5px; padding: 3px 8px; font-size: 12px; outline: none;
   }
   .name-edit input:focus { border-color: var(--accent); }
+  .proj-name:focus { border-color: var(--accent); }
   .url { color: var(--text-faint); font-size: 11px; word-break: break-all; margin-top: 3px; }
   .fname {
     width: 100%; margin-top: 6px; box-sizing: border-box;
@@ -204,6 +205,16 @@
     color: var(--text); border-radius: 5px; padding: 5px 8px; font-size: 12px; outline: none;
   }
   .fname:focus { border-color: var(--accent); }
+  /* 项目更名弹窗 */
+  #proj-mask { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: center; justify-content: center; z-index: 60; }
+  #proj-mask.show { display: flex; }
+  #proj-box { width: 340px; max-height: 82vh; overflow: auto; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; box-shadow: 0 10px 40px rgba(0,0,0,.4); }
+  #proj-box .card-title { margin-bottom: 10px; }
+  .proj-item { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
+  .proj-item .pl { font-size: 11px; color: var(--text-dim); width: 86px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: none; }
+  .proj-item input { flex: 1; min-width: 0; background: var(--card); border: 1px solid var(--border); color: var(--text); border-radius: 5px; padding: 5px 8px; font-size: 12px; outline: none; }
+  .proj-item input:focus { border-color: var(--accent); }
+  #proj-box .row { margin-top: 14px; display: flex; justify-content: flex-end; }
   /* 保存目录：完整路径可换行显示，点击即弹出选择框 */
   .save-path {
     margin-top: 4px; width: 100%; box-sizing: border-box;
@@ -302,6 +313,8 @@
       <span class="lbl">下载后混流</span>
       <span class="switch" id="sw-mux" title="下载后用 tools/ffmpeg.exe（优先）或 tools/mkvmerge.exe 将视频轨+音频轨合并为单个 mkv"></span>
     </div>
+    <!-- 混流工具缺失/出错的持久提示（轮询刷新，非一次性 toast） -->
+    <div class="meta" id="mux-hint" style="margin-top:4px;color:var(--red);display:none;"></div>
     <div class="setting-row">
       <span class="lbl">嗅探状态</span>
       <span class="val" id="diag-text" style="font-weight:500;color:var(--text-dim)">检测中…</span>
@@ -312,6 +325,13 @@
       <button class="mini" id="set-open">打开</button>
     </div>
     <div class="save-path" id="set-save-dir" title="">未设置</div>
+  </div>
+
+  <!-- 项目更名：常驻入口，不依赖下载状态，列出所有已注册项目 -->
+  <div class="card">
+    <div class="card-title">📁 项目更名</div>
+    <button class="mini primary" id="btn-proj-rename" data-act="open-proj" style="width:100%">按项目批量改名（视频/音频一并改）</button>
+    <div class="meta" style="margin-top:6px">捕获到媒体轨道后，可在此按项目统一设置输出文件名</div>
   </div>
 
   <!-- 播放速度（独立高亮卡片，置于顶部确保可见） -->
@@ -368,10 +388,20 @@
   </div>
 </div>
 
+
+<!-- 项目更名弹窗（常驻入口，列出所有已注册项目） -->
+<div id="proj-mask">
+  <div id="proj-box">
+    <div class="card-title">📁 项目更名（按项目统一管理文件名）</div>
+    <div id="proj-list"></div>
+    <div class="row"><button class="mini" data-act="close-proj">关闭</button></div>
+  </div>
+</div>
 <script>
 (function () {
   "use strict";
   var invoke = window.__TAURI__.core.invoke;
+  var allTracks = [];
 
   var $ = function (id) { return document.getElementById(id); };
   function escapeHtml(s) {
@@ -557,7 +587,7 @@
         + '<button class="mini" data-act="rename" data-id="' + t.id + '">重命名</button>'
         + '</div>'
         + '<div class="name-edit" id="ne-' + t.id + '" style="display:none">'
-        + '<input id="nei-' + t.id + '" value="' + escapeAttr(t.name || t.title || "") + '" placeholder="自定义文件名">'
+        + '<input id="nei-' + t.id + '" value="' + escapeAttr(t.name || t.title || "") + '" placeholder="自定义文件名（仅本文件）">'
         + '<button class="mini primary" data-act="namesave" data-id="' + t.id + '">保存</button>'
         + '</div>'
         + '</div>';
@@ -603,63 +633,91 @@
   // 统一下载管理器：直链下载 + MSE 轨道中正在下载 / 收尾 / 已完成的项
   function renderDirects(ds, ts) {
     var box = $("directs");
-    var entries = [];
+    var trackEntries = [];
     for (var i = 0; i < ts.length; i++) {
       var t = ts[i];
-      if (t.downloading || t.finalizing || t.finalized) {
-        entries.push({ type: "track", t: t });
-      }
+      if (t.downloading || t.finalizing || t.finalized) trackEntries.push(t);
     }
-    for (var j = 0; j < ds.length; j++) {
-      entries.push({ type: "direct", d: ds[j] });
-    }
-    $("direct-count").textContent = entries.length ? entries.length + " 项" : "";
-    if (!entries.length) {
+    var directs = ds || [];
+    $("direct-count").textContent = (trackEntries.length + directs.length) ? (trackEntries.length + directs.length) + " 项" : "";
+    if (!trackEntries.length && !directs.length) {
       box.innerHTML = '<div class="empty">暂无下载任务（MSE 捕获或直链下载后，进度显示在此）</div>';
       return;
     }
     var html = "";
-    for (var k = 0; k < entries.length; k++) {
-      var e = entries[k];
-      if (e.type === "direct") {
-        var d = e.d;
-        var pct = d.total ? Math.min(100, Math.round(d.done / d.total * 100)) : 0;
-        var stLbl = d.downloading ? "下载中" : (d.aborted ? "已中止" : (d.finished ? "完成" : "等待"));
-        var stCls = d.downloading ? "dl" : (d.aborted ? "err" : (d.finished ? "done" : "fin"));
-        html += '<div class="item">'
-          + '<div class="item-top">'
-          + '<span class="badge direct">直链</span>'
-          + '<span class="id">' + shortUrl(d.name, 18) + '</span>'
-          + '<span class="state ' + stCls + '">' + stLbl + '</span>'
-          + '</div>'
-          + '<div class="meta">' + fmtBytes(d.done) + (d.total ? " / " + fmtBytes(d.total) : "") + '</div>'
-          + (d.downloading ? '<div class="prog"><div style="width:' + pct + '%"></div></div>' : "")
-          + (d.error ? '<div class="url">✗ ' + shortUrl(d.error, 60) + '</div>' : "")
-          + (d.outPath ? '<div class="url">✓ ' + shortUrl(d.outPath, 60) + '</div>' : "")
-          + (d.downloading ? '<div class="ops"><button class="mini danger" data-act="stop-direct" data-id="' + d.id + '">停止</button></div>' : "")
-          + '</div>';
-      } else {
-        var tr = e.t;
-        var trBytes = tr.bytes || 0;
-        var trLbl = tr.finalized ? "完成" : (tr.finalizing ? "收尾中" : "下载中");
-        var trCls = tr.finalized ? "done" : (tr.finalizing ? "fin" : "dl");
-        var trName = tr.title ? tr.title : (tr.kind + "_" + tr.id);
-        var trExt = tr.kind === "audio" ? ".m4a" : ".mp4";
-        html += '<div class="item">'
-          + '<div class="item-top">'
-          + '<span class="badge ' + tr.kind + '">' + kindLabel(tr.kind) + '</span>'
-          + '<span class="id" title="' + escapeAttr(trName + trExt) + '">' + shortUrl(trName, 18) + '</span>'
-          + '<span class="ext">' + trExt + '</span>'
-          + '<span class="state ' + trCls + '">' + trLbl + '</span>'
-          + '</div>'
-          + '<div class="meta">' + fmtBytes(trBytes) + ' · ' + tr.segments + ' 分片 · 轨 #' + tr.id + '</div>'
-          + (tr.finalized && tr.outPath ? '<div class="url">✓ ' + shortUrl(tr.outPath, 60) + '</div>' : "")
-          + (tr.downloading ? '<div class="ops"><button class="mini danger" data-act="stop" data-id="' + tr.id + '">停止</button></div>' : "")
-          + '</div>';
-      }
+    // 下载管理面板只展示单个文件（视频/音频）；项目级更名在左侧栏顶部「📁 项目更名」独立入口处理
+    for (var i = 0; i < trackEntries.length; i++) {
+      var tr = trackEntries[i];
+      var trBytes = tr.bytes || 0;
+      var trLbl = tr.finalized ? "完成" : (tr.finalizing ? "收尾中" : "下载中");
+      var trCls = tr.finalized ? "done" : (tr.finalizing ? "fin" : "dl");
+      var trName = tr.title ? tr.title : (tr.kind + "_" + tr.id);
+      var trExt = tr.kind === "audio" ? ".m4a" : ".mp4";
+      html += '<div class="item">'
+        + '<div class="item-top">'
+        + '<span class="badge ' + tr.kind + '">' + kindLabel(tr.kind) + '</span>'
+        + '<span class="id" title="' + escapeAttr(trName + trExt) + '">' + shortUrl(trName, 18) + '</span>'
+        + '<span class="ext">' + trExt + '</span>'
+        + '<span class="state ' + trCls + '">' + trLbl + '</span>'
+        + '</div>'
+        + '<div class="meta">' + fmtBytes(trBytes) + ' · ' + tr.segments + ' 分片 · 轨 #' + tr.id + '</div>'
+        + (tr.finalized && tr.outPath ? '<div class="url">✓ ' + shortUrl(tr.outPath, 60) + '</div>' : "")
+        + (tr.downloading ? '<div class="ops"><button class="mini danger" data-act="stop" data-id="' + tr.id + '">停止</button></div>' : "")
+        + '</div>';
+    }
+    // 直链下载
+    for (var j = 0; j < directs.length; j++) {
+      var d = directs[j];
+      var pct = d.total ? Math.min(100, Math.round(d.done / d.total * 100)) : 0;
+      var stLbl = d.downloading ? "下载中" : (d.aborted ? "已中止" : (d.finished ? "完成" : "等待"));
+      var stCls = d.downloading ? "dl" : (d.aborted ? "err" : (d.finished ? "done" : "fin"));
+      html += '<div class="item">'
+        + '<div class="item-top">'
+        + '<span class="badge direct">直链</span>'
+        + '<span class="id">' + shortUrl(d.name, 18) + '</span>'
+        + '<span class="state ' + stCls + '">' + stLbl + '</span>'
+        + '</div>'
+        + '<div class="meta">' + fmtBytes(d.done) + (d.total ? " / " + fmtBytes(d.total) : "") + '</div>'
+        + (d.downloading ? '<div class="prog"><div style="width:' + pct + '%"></div></div>' : "")
+        + (d.error ? '<div class="url">✗ ' + shortUrl(d.error, 60) + '</div>' : "")
+        + (d.outPath ? '<div class="url">✓ ' + shortUrl(d.outPath, 60) + '</div>' : "")
+        + (d.downloading ? '<div class="ops"><button class="mini danger" data-act="stop-direct" data-id="' + d.id + '">停止</button></div>' : "")
+        + '</div>';
     }
     box.innerHTML = html;
   }
+
+  // 项目更名弹窗：列出所有已注册项目（不依赖下载状态）
+  function openProjRename() {
+    var list = $("proj-list");
+    var seen = {}, projs = [];
+    for (var i = 0; i < allTracks.length; i++) {
+      var t = allTracks[i];
+      var pk = t.project || ("#" + t.id);
+      if (!seen[pk]) { seen[pk] = true; projs.push({ key: pk, name: t.name || t.title || "" }); }
+    }
+    if (!projs.length) {
+      list.innerHTML = '<div class="empty">尚未捕获到媒体轨道，暂无可更名项目</div>';
+    } else {
+      var html = "";
+      for (var j = 0; j < projs.length; j++) {
+        var pr = projs[j];
+        var cur = projRenameVals[pr.key] != null ? projRenameVals[pr.key] : pr.name;
+        var shortKey = pr.key.length > 12 ? pr.key.slice(0, 12) + "…" : pr.key;
+        html += '<div class="proj-item">'
+          + '<span class="pl" title="' + escapeAttr(pr.key) + '">' + escapeHtml(shortKey) + '</span>'
+          + '<input class="proj-in" data-project="' + escapeAttr(pr.key) + '" value="' + escapeAttr(cur) + '" placeholder="新项目名">' + 
+          + '<button class="mini primary" data-act="proj-save" data-project="' + escapeAttr(pr.key) + '">保存</button>'
+          + '</div>';
+      }
+      list.innerHTML = html;
+    }
+    $("proj-mask").classList.add("show");
+  }
+  function closeProjRename() { $("proj-mask").classList.remove("show"); }
+  document.getElementById("proj-mask").addEventListener("click", function (e) {
+    if (e.target === this) closeProjRename();
+  });
 
   function escapeAttr(s) {
     return String(s).replace(/"/g, "&quot;").replace(/&/g, "&amp;").replace(/</g, "&lt;");
@@ -672,13 +730,17 @@
   // 二者配合 600ms 刷新重建 DOM 时恢复展开态与已输入内容，避免被清空。
   var renameOpen = {};
   var renameVals = {};
+  // 项目级更名输入框内容（key=project），避免 600ms 刷新清空
+  var projRenameVals = {};
 
   // ---------- 事件委托 ----------
   document.addEventListener("input", function (e) {
     var inp = e.target.closest("input.fname");
     if (inp) { reportNames[inp.dataset.url] = inp.value; return; }
     var ne = e.target.closest("input[id^='nei-']");
-    if (ne) { renameVals[ne.id.slice(4)] = ne.value; }
+    if (ne) { renameVals[ne.id.slice(4)] = ne.value; return; }
+    var pe = e.target.closest("input.proj-name");
+    if (pe) { projRenameVals[pe.dataset.project] = pe.value; }
   });
 
   document.addEventListener("click", function (e) {
@@ -707,10 +769,25 @@
       var input2 = $("nei-" + id);
       var val = input2 ? input2.value : "";
       renameVals[id] = val;
-      invoke("set_name", { trackId: String(id), name: val }).catch(console.error);
+      // 逐文件更名：仅本视频/音频轨道（命令参数键为 trackId，见 main.rs set_name）
+      invoke("set_name", { trackId: id, name: val }).catch(console.error);
       renameOpen[id] = false;
       var boxEl2 = $("ne-" + id);
       if (boxEl2) boxEl2.style.display = "none";
+    }
+    else if (act === "proj-save") {
+      var pitem = btn.closest(".proj-item");
+      var pinp = pitem ? pitem.querySelector("input.proj-in") : null;
+      var pval2 = pinp ? pinp.value : "";
+      var pkey2 = btn.dataset.project || "";
+      projRenameVals[pkey2] = pval2;
+      invoke("set_project_name", { project: pkey2, name: pval2 }).catch(console.error);
+    }
+    else if (act === "open-proj") {
+      openProjRename();
+    }
+    else if (act === "close-proj") {
+      closeProjRename();
     }
     else if (act === "dl-report") {
       var url = btn.dataset.url, type = btn.dataset.type, title = btn.dataset.title, idx = btn.dataset.idx;
@@ -769,6 +846,7 @@
       if (!editingTrack) renderTracks(s.tracks || []);
       if (!editingReport) renderReports(s.reports || []);
       renderDirects(s.directs || [], s.tracks || []);
+      allTracks = s.tracks || [];
       // 设置同步（避免与服务端状态脱节）
       if (lastSettings !== s.enabled + "|" + s.auto + "|" + s.rate + "|" + s.copyUnlock + "|" + s.mux) {
         swEnabled.classList.toggle("on", !!s.enabled);
@@ -782,6 +860,13 @@
       $("status-dot").style.background = s.port ? "var(--green)" : "var(--red)";
       $("status-text").textContent = s.port ? ("服务器 :" + s.port) : "服务器未启动";
       setSaveDir(s.saveDir);
+      // 混流工具缺失/出错提示
+      var muxHint = $("mux-hint");
+      if (muxHint) {
+        var muxHintOn = !!s.mux && s.muxHint;
+        muxHint.style.display = muxHintOn ? "block" : "none";
+        if (muxHintOn) muxHint.textContent = "⚠ " + s.muxHint;
+      }
       // 嗅探状态诊断
       var diag = s.hookDiag || {};
       var diagEl = $("diag-text");

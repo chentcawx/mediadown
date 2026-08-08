@@ -11,26 +11,56 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
 
+use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
 const MAX_BODY: usize = 128 * 1024 * 1024; // 单个分片上限 128MB
 const PORT_RANGE: std::ops::Range<u16> = 49321..49331;
+const HEADER_TIMEOUT_SECS: u64 = 60; // 单连接读/写超时
+const READ_BUF: usize = 4096; // 头部读取缓冲
+const MAX_HEADER_LINES: usize = 16;
+const BODY_READ_BUF: usize = 8192; // body 续读缓冲
+const MAX_JSON_BODY: usize = 64 * 1024; // register/report/diag 控制面 JSON 上限（远小于分片上限），防恶意大包拖慢解析
+
+fn check_body_limit(content_length: usize) -> AppResult<()> {
+    if content_length > MAX_BODY {
+        Err(AppError::PayloadTooLarge(format!(
+            "请求体过大: {} > {} MB",
+            content_length,
+            MAX_BODY / 1024 / 1024
+        )))
+    } else {
+        Ok(())
+    }
+}
 
 pub fn spawn_server(
     state: Arc<AppState>,
     token: String,
     preferred_port: Option<u16>,
-) -> Result<u16, String> {
+) -> AppResult<u16> {
     // 优先使用命令行指定的端口
-    let preferred = preferred_port.and_then(|p| {
-        if p == 0 {
-            None
-        } else {
-            TcpListener::bind(("127.0.0.1", p)).ok().map(|l| (l, p))
-        }
-    });
+    let preferred = match preferred_port {
+        Some(p) if p != 0 => match TcpListener::bind(("127.0.0.1", p)) {
+            Ok(l) => {
+                // hook 自发现只扫 PORT_RANGE：指定区间外的端口时注入脚本永远发现不了服务器
+                if !PORT_RANGE.contains(&p) {
+                    eprintln!(
+                        "[httpd] 指定端口 {p} 不在 hook 自扫描区间 {}..{}，注入脚本将无法自发现",
+                        PORT_RANGE.start,
+                        PORT_RANGE.end
+                    );
+                }
+                Some((l, p))
+            }
+            Err(e) => {
+                eprintln!("[httpd] 指定端口 {p} 绑定失败（{e}），回退端口区间");
+                None
+            }
+        },
+        _ => None,
+    }; // 否则尝试固定区间端口
     let mut listener = preferred;
-    // 否则尝试固定区间端口
     if listener.is_none() {
         for port in PORT_RANGE {
             match TcpListener::bind(("127.0.0.1", port)) {
@@ -45,36 +75,57 @@ pub fn spawn_server(
     let (listener, port) = match listener {
         Some(x) => x,
         None => {
-            let l = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-            let p = l.local_addr().map_err(|e| e.to_string())?.port();
+            eprintln!(
+                "[httpd] 端口区间 {}..{} 全部被占用，回退系统随机端口（hook 将无法自发现）",
+                PORT_RANGE.start,
+                PORT_RANGE.end
+            );
+            let l = TcpListener::bind("127.0.0.1:0")?;
+            let p = l.local_addr()?.port();
             (l, p)
         }
     };
 
+    // 并发连接上限：防止本机被恶意/异常脚本瞬间灌爆线程
+    const MAX_CONNS: usize = 64;
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            match stream {
-                Ok(s) => {
-                    let st = state.clone();
-                    let tk = token.clone();
-                    std::thread::spawn(move || {
-                        let _ = handle(s, st, &tk);
-                    });
+            let s = match stream {
+                Ok(s) => s,
+                Err(e) => {
+                    // 连接层瞬时错误可恢复（如对端关闭），记录后继续服务，禁止静默退服
+                    eprintln!("[httpd] accept error: {e}");
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
                 }
-                Err(_) => break,
+            };
+            // 超限直接关闭新连接（drop 流句柄），避免无界线程爆炸
+            if active.load(std::sync::atomic::Ordering::Relaxed) >= MAX_CONNS {
+                continue;
             }
+            active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let st = state.clone();
+            let tk = token.clone();
+            let act = active.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = handle(s, st, &tk) {
+                    eprintln!("[httpd] handle error: {e}");
+                }
+                act.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            });
         }
     });
     Ok(port)
 }
 
-fn handle(mut stream: std::net::TcpStream, state: Arc<AppState>, token: &str) -> std::io::Result<()> {
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(60)));
-    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(60)));
+fn handle(mut stream: std::net::TcpStream, state: Arc<AppState>, token: &str) -> AppResult<()> {
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(HEADER_TIMEOUT_SECS)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(HEADER_TIMEOUT_SECS)));
 
-    let mut lines = [0usize; 16];
+    let mut lines = [0usize; MAX_HEADER_LINES];
     let mut n = 0usize;
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; READ_BUF];
     let mut end = 0usize;
     loop {
         match stream.read(&mut buf[end..]) {
@@ -93,14 +144,14 @@ fn handle(mut stream: std::net::TcpStream, state: Arc<AppState>, token: &str) ->
             break;
         }
         if end >= buf.len() {
-            eprintln!("[httpd] header too large");
+            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
             return Ok(());
         }
     }
 
     let header = std::str::from_utf8(&buf[..n]).map_err(|_| {
         let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "bad header")
+        AppError::InvalidArg("bad header".into())
     })?;
 
     for (i, line) in header.lines().enumerate() {
@@ -127,7 +178,7 @@ fn handle(mut stream: std::net::TcpStream, state: Arc<AppState>, token: &str) ->
     };
     let _version = parts.next();
 
-    let cors = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Expose-Headers: X-Download-Token\r\nAccess-Control-Allow-Private-Network: true\r\n";
+    let cors = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Private-Network: true\r\n";
 
     // CORS 预检（跨域 + https->127.0.0.1 私有网络访问都会触发 OPTIONS）。
     // 必须在路由前统一放行，否则浏览器会拦截真实 GET/POST（导致 /cfg 发现、
@@ -152,7 +203,7 @@ fn handle(mut stream: std::net::TcpStream, state: Arc<AppState>, token: &str) ->
         respond(&mut stream, 204, cors, &[])?;
     } else if target.starts_with("/seg/") {
         // 验证 token（token 在 /seg/{token}/... 位置）
-        let seg = &target[5..]; // 去掉 "/seg/"
+        let seg = target.strip_prefix("/seg/").unwrap_or(&target); // 去掉 "/seg/"
         let mut seg_parts = seg.split('/');
         let check_token = seg_parts.next().unwrap_or("");
         let a = seg_parts.next().unwrap_or("").to_string();
@@ -166,14 +217,28 @@ fn handle(mut stream: std::net::TcpStream, state: Arc<AppState>, token: &str) ->
         // 读取 body
         let mut content_length: usize = 0;
         let mut is_chunked = false;
+        let mut has_cl = false;
         for line in header.lines().skip(1) {
             let ll = line.to_lowercase();
             if ll.starts_with("content-length:") {
+                // 重复 Content-Length 或与 Transfer-Encoding: chunked 并存属于
+                // 攻击/异常包：以 chunked 为准并忽略 CL（RFC 7230 §3.3.3）
                 if let Ok(v) = line["content-length:".len()..].trim().parse::<usize>() {
-                    content_length = v;
+                    if !has_cl && content_length == 0 {
+                        content_length = v;
+                    }
+                    has_cl = true;
                 }
-            } else if ll.starts_with("transfer-encoding: trailers") || ll.contains("chunked") {
+            } else if ll.starts_with("transfer-encoding:") && ll.contains("chunked") {
                 is_chunked = true;
+            }
+        }
+
+        // 单分片体积上限（普通 Content-Length 在读到 body 前就拦截）
+        if !is_chunked {
+            if let Err(e) = check_body_limit(content_length) {
+                respond(&mut stream, 413, cors, e.to_string().as_bytes())?;
+                return Ok(());
             }
         }
 
@@ -181,7 +246,13 @@ fn handle(mut stream: std::net::TcpStream, state: Arc<AppState>, token: &str) ->
         let body = if is_chunked {
             // 解析 chunked 传输编码（fetch 偶发分块上传），避免旧实现直接丢弃
             // body 造成分片缺失、进而在播放时产生空白段。
-            read_chunked_body(&mut stream, &buf[body_start..end])?
+            match read_chunked_body(&mut stream, &buf[body_start..end]) {
+                Ok(b) => b,
+                Err(e) => {
+                    respond(&mut stream, 413, cors, e.to_string().as_bytes())?;
+                    return Ok(());
+                }
+            }
         } else {
             if body_start + content_length <= end {
                 buf[body_start..body_start + content_length].to_vec()
@@ -192,7 +263,7 @@ fn handle(mut stream: std::net::TcpStream, state: Arc<AppState>, token: &str) ->
                     body.extend_from_slice(&buf[body_start..end]);
                 }
                 while body.len() < content_length {
-                    let mut tmp = [0u8; 8192];
+                    let mut tmp = [0u8; BODY_READ_BUF];
                     match stream.read(&mut tmp) {
                         Ok(0) => break,
                         Ok(nread) => body.extend_from_slice(&tmp[..nread]),
@@ -213,7 +284,14 @@ fn handle(mut stream: std::net::TcpStream, state: Arc<AppState>, token: &str) ->
                     respond(&mut stream, 200, cors, text.as_bytes())?;
                 }
                 Err(e) => {
-                    respond(&mut stream, 500, cors, e.as_bytes())?;
+                    // 把“客户端传错”映射为 4xx，而非一律 500
+                    let status = match &e {
+                        AppError::InvalidArg(_) => 400,
+                        AppError::NotFound(_) => 404,
+                        AppError::PayloadTooLarge(_) => 413,
+                        _ => 500,
+                    };
+                    respond(&mut stream, status, cors, e.to_string().as_bytes())?;
                 }
             }
         }
@@ -224,35 +302,44 @@ fn handle(mut stream: std::net::TcpStream, state: Arc<AppState>, token: &str) ->
     Ok(())
 }
 
-fn handle_seg(a: &str, b: &str, body: &[u8], state: Arc<AppState>) -> Result<String, String> {
+fn handle_seg(a: &str, b: &str, body: &[u8], state: Arc<AppState>) -> AppResult<String> {
+    if matches!(a, "register" | "report" | "diag") && body.len() > MAX_JSON_BODY {
+        return Err(AppError::PayloadTooLarge(format!(
+            "JSON 请求体过大: {} > {} KB",
+            body.len(),
+            MAX_JSON_BODY / 1024
+        )));
+    }
     match a {
         "register" => {
-            let info: serde_json::Value =
-                serde_json::from_slice(body).map_err(|e| e.to_string())?;
+            let info: serde_json::Value = serde_json::from_slice(body)?;
             let kind = info["kind"].as_str().unwrap_or("video");
             let mime = info["mime"].as_str().unwrap_or("");
             let ext = info["ext"].as_str().unwrap_or("mp4");
             let family = info["family"].as_str().unwrap_or("mp4");
             let title = info["title"].as_str().unwrap_or("");
+            // 播放会话分组（hook 按 MediaSource 分配）：混流配对的稳定主键，
+            // 缺省空串（旧 hook 兼容：配对退化为按同名 title）。
+            let session = info["session"].as_str().unwrap_or("");
             let auto = state.auto.load(std::sync::atomic::Ordering::Relaxed);
-            let id = state.register_track(kind, mime, ext, family, title, auto);
+            let id = state.register_track(kind, mime, ext, family, title, session, auto);
             Ok(serde_json::json!({"id": id}).to_string())
         }
         "report" => {
-            let rep: serde_json::Value =
-                serde_json::from_slice(body).map_err(|e| e.to_string())?;
+            let rep: serde_json::Value = serde_json::from_slice(body)?;
             state.add_media_report(&rep)?;
             Ok("ok".into())
         }
         "diag" => {
-            let v: serde_json::Value =
-                serde_json::from_slice(body).map_err(|e| e.to_string())?;
+            let v: serde_json::Value = serde_json::from_slice(body)?;
             state.set_hook_diag(&v);
             Ok("ok".into())
         }
         _ => {
             if b == "end" {
-                let id: u32 = a.parse::<u32>().map_err(|e: std::num::ParseIntError| e.to_string())?;
+                let id: u32 = a
+                    .parse()
+                    .map_err(|_| AppError::InvalidArg("bad track id".into()))?;
                 state.track_ended(id)?;
                 // 自动下载开启且仍在下载时，流结束后自动收尾为可播放文件
                 // （参照 media-sniffer-extension 的 endOfStream 自动保存行为）
@@ -266,7 +353,9 @@ fn handle_seg(a: &str, b: &str, body: &[u8], state: Arc<AppState>) -> Result<Str
                 Ok("ok".into())
             } else {
                 // /seg/{token}/{trackId}/chunk
-                let track_id: u32 = a.parse::<u32>().map_err(|e: std::num::ParseIntError| e.to_string())?;
+                let track_id: u32 = a
+                    .parse()
+                    .map_err(|_| AppError::InvalidArg("bad track id".into()))?;
                 state.append_chunk(track_id, body)?;
                 Ok("ok".into())
             }
@@ -279,7 +368,7 @@ fn respond(
     status: u16,
     extra_headers: &str,
     body: &[u8],
-) -> std::io::Result<()> {
+) -> AppResult<()> {
     let status_text = match status {
         200 => "OK",
         204 => "No Content",
@@ -304,7 +393,7 @@ fn respond(
 /// 解析 chunked Transfer-Encoding 的 body（用于 fetch 偶发的分块上传）。
 /// `initial` 是已读入缓冲区、属于 body 起始部分的字节（首个 chunk-size 行可能已在其中）。
 /// 避免旧实现直接 `vec![]` 丢弃 body 导致分片缺失、播放出现空白段。
-fn read_chunked_body(stream: &mut std::net::TcpStream, initial: &[u8]) -> std::io::Result<Vec<u8>> {
+fn read_chunked_body(stream: &mut std::net::TcpStream, initial: &[u8]) -> AppResult<Vec<u8>> {
     let mut body: Vec<u8> = Vec::new();
     let mut buf: Vec<u8> = Vec::from(initial);
     loop {
@@ -346,6 +435,12 @@ fn read_chunked_body(stream: &mut std::net::TcpStream, initial: &[u8]) -> std::i
         }
         if buf.len() >= size {
             body.extend_from_slice(&buf[..size]);
+            if body.len() > MAX_BODY {
+                return Err(AppError::PayloadTooLarge(format!(
+                    "请求体过大: chunked > {} MB",
+                    MAX_BODY / 1024 / 1024
+                )));
+            }
             buf.drain(0..size);
             if buf.len() >= 2 {
                 buf.drain(0..2); // 丢弃 CRLF

@@ -1,8 +1,12 @@
+use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::error::{AppError, AppResult};
+use media_down_lib::fmp4;
 use serde_json::json;
 use tauri::AppHandle;
 use tauri::Emitter;
@@ -10,7 +14,7 @@ use tauri::Emitter;
 pub type TrackId = u32;
 pub type DirectId = u64;
 
-/// 当前 Unix 时间戳（毫秒），用于连播场景按注册时间最近配对音视频轨。
+/// 当前 Unix 时间戳（毫秒），用于连播场景按注册时间最近配对音视频轨�?
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -18,7 +22,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 轨道（视频 / 音频 / 字幕）
+/// 轨道（视�?/ 音频 / 字幕�?
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TrackInfo {
     pub id: TrackId,
@@ -33,17 +37,17 @@ pub struct TrackInfo {
     pub finalizing: bool,
     pub finalized: bool,
     pub out_path: Option<String>,
-    pub muxed: bool,         // 是否已参与 mkvmerge 混流（避免重复触发）
+    pub muxed: bool,         // 是否已参�?mkvmerge 混流（避免重复触发）
     pub mime_family: String, // mp4 | webm | other（决定收尾方式）
     pub title: String,       // 来源页面标题，作为默认文件名
-    pub registered_at: u64,  // 注册时刻(ms)，连播场景用于按时间最近配对音视频轨
+    pub project: String,     // 项目分组键（默认=标题；空标题退化为 id）；用于“按项目更名”批量改 video+audio
+    pub session: String,     // 播放会话键（同一 MediaSource 的音/视频共享）：混流配对的可靠主键
+    pub registered_at: u64,  // 注册时刻(ms)，连播场景用于按时间最近配对音视频�?
 }
 
-/// 正在落盘的轨道句柄
+/// 正在落盘的轨道句�?
 pub struct TrackWriter {
-    pub id: TrackId,
     pub file: std::fs::File,
-    pub tmp_path: String,
     pub bytes: u64,
     pub segments: u64,
 }
@@ -63,52 +67,66 @@ pub struct DirectInfo {
     pub aborted: bool,
 }
 
-/// 未开始下载时，分片暂存的内存缓冲上限（开始下载后立即落盘，避免丢帧）
-const PRE_BUF_CAP: usize = 32 * 1024 * 1024;
-
+/// 未开始下载时，原先的分片内存缓冲已移除：改为“边下边存”，首个分片到达即落盘。
+/// 分片不再在系统内存中堆积（避免大视频占用 RAM，且不会在 32MB 上限处丢片）。
 pub struct AppState {
     pub server_token: String,
     pub server_port: AtomicU32,
-    pub rate: AtomicU32, // 倍速*100
+    pub rate: AtomicU32, // 倍�?100
     pub enabled: AtomicBool,
     pub auto: AtomicBool,
-    pub copy_unlock: AtomicBool, // 解除复制限制（user-select / 右键 / 复制拦截）
-    pub mux: AtomicBool,         // 下载后自动混流（优先 tools/ffmpeg.exe，缺失时回退 tools/mkvmerge.exe；video+audio -> mkv）
-    pub app_handle: Mutex<Option<AppHandle>>, // 混流完成后向 UI 推送 md-mux 事件
-    pub track_seq: Mutex<TrackId>,
+    pub copy_unlock: AtomicBool, // 解除复制限制（user-select / 右键 / 复制拦截�?
+    pub mux: AtomicBool,         // 下载后自动混流（优先 tools/ffmpeg.exe，缺失时回退 tools/mkvmerge.exe；video+audio -> mkv�?
+    pub mux_hint: Mutex<String>, // 混流工具缺失的持久提示（UI 轮询展示，非一次性 toast）
+    pub app_handle: Mutex<Option<AppHandle>>, // 混流完成后向 UI 推�?md-mux 事件
+    pub track_seq: AtomicU32,
     pub tracks: Mutex<Vec<TrackInfo>>,
-    pub writers: Mutex<Vec<TrackWriter>>,
-    pub pre_buf: Mutex<HashMap<TrackId, Vec<u8>>>,
-    pub direct_seq: Mutex<DirectId>,
+    pub writers: Mutex<HashMap<TrackId, Arc<Mutex<TrackWriter>>>>, // 每轨独立写锁：跨轨写盘互不阻塞
     pub directs: Mutex<Vec<DirectInfo>>,
-    pub name_overrides: Mutex<HashMap<String, String>>,
-    pub reports: Mutex<Vec<serde_json::Value>>, // hook 上报的直链媒体
+    pub name_overrides: Mutex<HashMap<String, String>>,     // 逐轨自定义名（trackId -> name�?
+    pub project_overrides: Mutex<HashMap<String, String>>,  // 项目级自定义名（project -> name），批量�?video+audio
+    pub reports: Mutex<Vec<serde_json::Value>>, // hook 上报的直链媒�?
     pub hook_diag: Mutex<serde_json::Value>,     // hook 自上报的诊断信息
-    pub save_dir: Mutex<String>,                 // 下载保存目录（可被命令行/设置覆盖）
+    pub save_dir: Mutex<String>,                 // 下载保存目录（可被命令行/设置覆盖�?
+}
+
+/// 会话令牌：用 OS 熵种子（RandomState 各自独立初始化）派生不可预测值。
+/// 仅绑定 127.0.0.1，但重启间也不该被猜中。
+fn new_token() -> String {
+    let s1 = RandomState::new();
+    let s2 = RandomState::new();
+    let mut a = s1.build_hasher();
+    a.write_u64(std::process::id() as u64);
+    a.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    let mut b = s2.build_hasher();
+    b.write_u64(a.finish());
+    b.write_u128(now_ms() as u128);
+    format!("mdtk{:016x}{:016x}", a.finish(), b.finish())
 }
 
 impl AppState {
     pub fn new() -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
         AppState {
-            server_token: format!("mdtk{}-{:x}", std::process::id(), now),
+            server_token: new_token(),
             server_port: AtomicU32::new(0),
             rate: AtomicU32::new(100),
             enabled: AtomicBool::new(true),
             auto: AtomicBool::new(true),
             copy_unlock: AtomicBool::new(true),
             mux: AtomicBool::new(true),
+            mux_hint: Mutex::new(String::new()),
             app_handle: Mutex::new(None),
-            track_seq: Mutex::new(1),
+            track_seq: AtomicU32::new(1),
             tracks: Mutex::new(Vec::new()),
-            writers: Mutex::new(Vec::new()),
-            pre_buf: Mutex::new(HashMap::new()),
-            direct_seq: Mutex::new(1),
+            writers: Mutex::new(HashMap::new()),
             directs: Mutex::new(Vec::new()),
             name_overrides: Mutex::new(HashMap::new()),
+            project_overrides: Mutex::new(HashMap::new()),
             reports: Mutex::new(Vec::new()),
             hook_diag: Mutex::new(serde_json::json!({})),
             save_dir: Mutex::new(
@@ -130,80 +148,88 @@ impl AppState {
     pub fn rate(&self) -> f64 {
         self.rate.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0
     }
-    pub fn set_rate(&self, r: f64) -> Result<(), String> {
+    pub fn set_rate(&self, r: f64) -> AppResult<()> {
+        // NaN/Inf 的 clamp 结果是 NaN，as u32 会变成 0 → 视频停滞；显式拒绝非法值
+        if !r.is_finite() {
+            return Err(AppError::InvalidArg(format!("倍速必须是有穷数值，收到 {r}")));
+        }
         let v = (r.clamp(0.1, 16.0) * 100.0) as u32;
         self.rate.store(v, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
-    pub fn set_enabled(&self, e: bool) -> Result<(), String> {
+    pub fn set_enabled(&self, e: bool) -> AppResult<()> {
         self.enabled.store(e, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
-    pub fn set_auto(&self, a: bool) -> Result<(), String> {
+    pub fn set_auto(&self, a: bool) -> AppResult<()> {
         self.auto.store(a, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
     pub fn copy_unlock(&self) -> bool {
         self.copy_unlock.load(std::sync::atomic::Ordering::Relaxed)
     }
-    pub fn set_copy_unlock(&self, v: bool) -> Result<(), String> {
+    pub fn set_copy_unlock(&self, v: bool) -> AppResult<()> {
         self.copy_unlock.store(v, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
-    /// 下载后自动 mkvmerge 混流开关
-    pub fn set_mux(&self, m: bool) -> Result<(), String> {
+    /// 下载后自�?mkvmerge 混流开�?
+    pub fn set_mux(&self, m: bool) -> AppResult<()> {
         self.mux.store(m, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
-    /// 记录 AppHandle，供混流线程向 UI 推送 md-mux 事件
+    /// 记录 AppHandle，供混流线程�?UI 推�?md-mux 事件
     pub fn set_app(&self, h: AppHandle) {
         *self.app_handle.lock().unwrap() = Some(h);
     }
 
-    /// 向 UI 推送混流状态事件（无 AppHandle 时静默）
+    /// �?UI 推送混流状态事件（�?AppHandle 时静默）
     fn emit_mux(&self, status: &str, msg: &str) {
         if let Some(a) = self.app_handle.lock().unwrap().clone() {
             let _ = a.emit("md-mux", json!({ "status": status, "msg": msg }));
         }
     }
 
-    /// 某条轨道收尾完成后调用：若同标题存在另一条“相反类型、已收尾、未混流”的轨道，
-    /// 则自动调用 <exe_dir>/tools/ffmpeg.exe（优先）或 tools/mkvmerge.exe 将 video+audio 混流为单个 mkv 文件。
+    /// 混流工具缺失时写入持久提示（snapshot 透传给 UI 常驻显示）
+    fn set_mux_hint(&self, hint: &str) {
+        *self.mux_hint.lock().unwrap() = hint.to_string();
+    }
+
+    /// 某条轨道收尾完成后调用：若同标题存在另一条“相反类型、已收尾、未混流”的轨道�?
+    /// 则自动调�?<exe_dir>/tools/ffmpeg.exe（优先）�?tools/mkvmerge.exe �?video+audio 混流为单�?mkv 文件�?
     pub fn notify_finalized(&self, id: TrackId) {
         if !self.mux.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        // 优先用 ffmpeg（更稳地解析 fragmented MP4 并对齐两轨零点），缺失时回退 mkvmerge
-        let ffmpeg = Self::ffmpeg_path();
-        let mkv = Self::mkvmerge_path();
-        let (tool, is_ff): (std::path::PathBuf, bool) = if ffmpeg.exists() {
-            (ffmpeg, true)
-        } else if mkv.exists() {
-            (mkv, false)
-        } else {
-            self.emit_mux("skip", "未找到 tools/ffmpeg.exe 或 tools/mkvmerge.exe，已跳过自动混流");
-            return;
+        // 优先�?ffmpeg（更稳地解析 fragmented MP4 并对齐两轨零点），缺失时回退 mkvmerge
+        let (tool, is_ff) = match Self::pick_mux_tool() {
+            Some(x) => x,
+            None => {
+                self.set_mux_hint("未找到混流工具：请把 ffmpeg.exe 或 mkvmerge.exe 放到程序目录 tools 下");
+                self.emit_mux("skip", "未找到 tools/ffmpeg.exe 或 tools/mkvmerge.exe，已跳过自动混流");
+                return;
+            }
         };
-        // 寻找配对轨道（同标题、相反类型、均已收尾且未混流）
+        // 配对与 muxed 标记在同一临界区完成：音/视频两条收尾线程几乎同时 end、
+        // 并发 notify 时，任何一刻只有一方能占据配对资格，杜绝双进程写同一 .mkv。
         let pair = {
-            let ts = self.tracks.lock().unwrap();
+            let mut ts = self.tracks.lock().unwrap();
             let me = match ts.iter().find(|t| t.id == id) {
                 Some(t) => t.clone(),
                 None => return,
             };
-            if me.muxed || !me.finalized || me.title.trim().is_empty() {
+            if me.muxed || !me.finalized {
                 return;
             }
             if me.kind != "video" && me.kind != "audio" {
                 return;
             }
-            // 连播/下一集场景：同标题可能有多段(video/audio 各多个)，
-            // 仅按 title 配对会错配跨段轨道(V1 配 A2)；改为在「同标题+异 kind+
-            // 均已 finalized+未 muxed」候选中，选 registered_at 与 me 最接近者
-            // （同一段视频的 V/A 几乎同时注册，相差毫秒级；跨段至少隔一个播放间隔）。
+            // 配对主键：同一播放会话（session，hook 按 MediaSource 分组，SPA 动态标题
+            // 下仍稳定）；回退：同标题（project）。标题为空时 session 仍可配对——
+            // 旧逻辑「标题为空则放弃」会静默杀死整个混流，需删除。
+            let title_hit = !me.project.is_empty() && me.project != me.id.to_string();
             let partner = ts
                 .iter()
                 .filter(|t| {
@@ -212,28 +238,24 @@ impl AppState {
                         && (t.kind == "video" || t.kind == "audio")
                         && t.finalized
                         && !t.muxed
-                        && t.title == me.title
+                        && (if !me.session.is_empty() && t.session == me.session {
+                            true
+                        } else {
+                            title_hit && t.project == me.project
+                        })
                 })
                 .min_by_key(|t| t.registered_at.abs_diff(me.registered_at))
                 .cloned();
-            match partner {
-                Some(p) => Some((me, p)),
-                None => None,
-            }
-        };
-        let (me, partner) = match pair {
-            Some(x) => x,
-            None => return,
-        };
-        // 立即标记两者已混流，避免彼此再次触发造成重复
-        {
-            let mut ts = self.tracks.lock().unwrap();
+            let Some(partner) = partner else { return };
+            // 立即标记两者已混流（不可分割：标记就在拿到配对后同一锁内完成）
             for t in ts.iter_mut() {
                 if t.id == me.id || t.id == partner.id {
                     t.muxed = true;
                 }
             }
-        }
+            (me, partner)
+        };
+        let (me, partner) = pair;
         let vpath = match me.out_path.clone() {
             Some(p) => p,
             None => return,
@@ -280,12 +302,12 @@ impl AppState {
             .unwrap_or_else(|| std::path::PathBuf::from("."))
     }
 
-    /// 配置文件路径：<exe_dir>/MediaDown.json（与绿色 exe 同目录，便于携带）
+    /// 配置文件路径�?exe_dir>/MediaDown.json（与绿色 exe 同目录，便于携带�?
     fn config_path() -> std::path::PathBuf {
         Self::exe_dir().join("MediaDown.json")
     }
 
-    /// 读取配置文件中保存的目录；解析失败或不存在返回 None
+    /// 读取配置文件中保存的目录；解析失败或不存在返�?None
     fn load_configured_dir() -> Option<String> {
         let txt = std::fs::read_to_string(Self::config_path()).ok()?;
         let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
@@ -297,16 +319,18 @@ impl AppState {
         }
     }
 
-    /// 将当前保存目录写入配置文件（失败静默忽略，内存值仍生效）
+    /// 将当前保存目录写入配置文件（失败静默忽略，内存值仍生效�?
     fn persist_config(dir: &str) {
-        let _ = std::fs::write(
+        if let Err(e) = std::fs::write(
             Self::config_path(),
             serde_json::to_string_pretty(&serde_json::json!({ "save_dir": dir }))
                 .unwrap_or_else(|_| "{\"save_dir\":\"\"}".into()),
-        );
+        ) {
+            eprintln!("[config] 保存目录写入失败: {e}");
+        }
     }
 
-    /// 默认保存目录：软件目录下的 ./downloads（绿色便携，不污染用户目录）
+    /// 默认保存目录：软件目录下�?./downloads（绿色便携，不污染用户目录）
     fn default_save_dir() -> String {
         Self::exe_dir()
             .join("downloads")
@@ -319,13 +343,13 @@ impl AppState {
         self.save_dir.lock().unwrap().clone()
     }
 
-    /// 覆盖保存目录（命令行参数 / 未来设置项）
-    pub fn set_save_dir(&self, dir: &str) -> Result<(), String> {
+/// 覆盖保存目录（命令行参数 / 未来设置项）
+    pub fn set_save_dir(&self, dir: &str) -> AppResult<()> {
         let d = dir.trim();
         if d.is_empty() {
-            return Err("保存目录不能为空".into());
+            return Err(AppError::InvalidArg("保存目录不能为空".into()));
         }
-        // 展开 ~ / ~/ 为 home
+        // 展开 ~ / ~/ �?home
         let expanded = if d == "~" {
             Self::default_save_dir()
         } else if let Some(rest) = d.strip_prefix("~/") {
@@ -337,13 +361,14 @@ impl AppState {
             d.to_string()
         };
         std::fs::create_dir_all(&expanded)
-            .map_err(|e| format!("无法创建目录 {}: {}", expanded, e))?;
+            .map_err(|e| AppError::DirCreateFailed(format!("无法创建目录 {}: {}", expanded, e)))?;
         *self.save_dir.lock().unwrap() = expanded.clone();
         Self::persist_config(&expanded);
         Ok(())
     }
 
-    /// 新轨道注册（hook 上报），auto=true 时立即开始落盘
+    /// 新轨道注册（hook 上报），auto=true 时立即开始落�?
+    #[allow(clippy::too_many_arguments)] // 注册参数来自 hook 上报 JSON 的固定字段，直传比结构体更直白
     pub fn register_track(
         &self,
         kind: &str,
@@ -351,23 +376,33 @@ impl AppState {
         ext: &str,
         mime_family: &str,
         title: &str,
+        session: &str,
         auto: bool,
     ) -> TrackId {
-        let mut seq = self.track_seq.lock().unwrap();
-        let id = *seq;
-        *seq += 1;
-        drop(seq);
+        let id = self.track_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
             let mut ts = self.tracks.lock().unwrap();
-            // 仅复用真正空轨(bytes==0 && segments==0)，否则必建新轨。
-            // 防止连播/下一集站点不发 endOfStream 时，第二段音频静默复用第一段
-            // 音频轨的 trackId，导致两段内容拼进同一 .m4a —— UI 看似"音频停滞"、mkv 配对跨段错配。
+            // 仅复用真正空�?bytes==0 && segments==0)，否则必建新轨�?
+            // 防止连播/下一集站点不�?endOfStream 时，第二段音频静默复用第一�?
+            // 音频轨的 trackId，导致两段内容拼进同一 .m4a —�?UI 看似"音频停滞"、mkv 配对跨段错配�?
             if let Some(t) = ts.iter_mut().find(|t| {
-                t.mime == mime && t.kind == kind && !t.ended && t.bytes == 0 && t.segments == 0
+                t.mime == mime
+                    && t.kind == kind
+                    && !t.ended
+                    && t.session == session
+                    && t.bytes == 0
+                    && t.segments == 0
             }) {
                 return t.id; // 空轨复用（仅限同 entry 残留的空轨）
             }
             let registered_at = now_ms();
+            // 项目分组键：默认用页面标题（同一标签页的视频+音频同属一个项目，
+            // 更名时一并改）；标题为空时退化为 id（逐轨独立，无法配对则不强行合并）�?
+            let project = if title.trim().is_empty() {
+                id.to_string()
+            } else {
+                title.trim().to_string()
+            };
             ts.push(TrackInfo {
                 id,
                 kind: kind.into(),
@@ -384,6 +419,8 @@ impl AppState {
                 muxed: false,
                 mime_family: mime_family.into(),
                 title: title.into(),
+                project,
+                session: session.into(),
                 registered_at,
             });
         }
@@ -393,25 +430,43 @@ impl AppState {
         id
     }
 
-    /// 分片到达：边下边存（未激活时先入内存缓冲，激活后补写）
-    pub fn append_chunk(&self, track_id: TrackId, data: &[u8]) -> Result<(), String> {
-        {
-            let mut ws = self.writers.lock().unwrap();
-            if let Some(w) = ws.iter_mut().find(|w| w.id == track_id) {
+    /// 分片到达：边下边存（首片到达即落盘，不在系统内存堆积）�?
+    /// �?writer 已存在直接追加；否则�?auto=true 时惰性创建临时文件并直写磁盘�?
+    /// auto=false 且未手动开始时则不落盘（保持“未开始下载”语义，且不产生内存缓冲）�?
+    pub fn append_chunk(&self, track_id: TrackId, data: &[u8]) -> AppResult<()> {
+        // 校验轨道已注册：防止拿到 token 的页面为任意 id 写盘（占满保存目录）。
+        // 分片总是先 /register 成功后才发送，因此正常路径不受影响。
+        let is_registered = {
+            let ts = self.tracks.lock().unwrap();
+            ts.iter().any(|t| t.id == track_id)
+        };
+        if !is_registered {
+            return Err(AppError::NotFound(format!(
+                "track {} 未注册",
+                track_id
+            )));
+        }
+        let has_writer = self.writer(track_id).is_some();
+        if has_writer {
+            if let Some(w) = self.writer(track_id) {
+                let mut w = w.lock().unwrap();
                 use std::io::Write;
-                w.file.write_all(data).map_err(|e| e.to_string())?;
+                w.file.write_all(data)?;
                 w.bytes += data.len() as u64;
                 w.segments += 1;
-            } else {
-                let mut pb = self.pre_buf.lock().unwrap();
-                let buf = pb.entry(track_id).or_default();
-                buf.extend_from_slice(data);
-                if buf.len() > PRE_BUF_CAP {
-                    let excess = buf.len() - PRE_BUF_CAP;
-                    buf.drain(0..excess);
-                }
+            }
+        } else if self.auto() {
+            // 边下边存：第一个分片抵达即开临时文件落盘，零内存缓冲
+            self.ensure_writer(track_id)?;
+            if let Some(w) = self.writer(track_id) {
+                let mut w = w.lock().unwrap();
+                use std::io::Write;
+                w.file.write_all(data)?;
+                w.bytes += data.len() as u64;
+                w.segments += 1;
             }
         }
+        // 计数（writer 缺失�?auto 关闭时仍累计显示，但实际未落盘）
         let mut ts = self.tracks.lock().unwrap();
         if let Some(t) = ts.iter_mut().find(|t| t.id == track_id) {
             t.bytes += data.len() as u64;
@@ -420,28 +475,11 @@ impl AppState {
         Ok(())
     }
 
-    /// 轨道结束（endOfStream）
-    pub fn track_ended(&self, track_id: TrackId) -> Result<(), String> {
-        let mut ts = self.tracks.lock().unwrap();
-        if let Some(t) = ts.iter_mut().find(|t| t.id == track_id) {
-            t.ended = true;
-        }
-        Ok(())
-    }
-
-    /// 开始下载：创建临时文件并先补写缓冲数据
-    pub fn download_start(&self, track_id: &str) -> Result<(), String> {
-        let id: TrackId = track_id.parse().map_err(|_| "bad track id")?;
-        {
-            let mut ts = self.tracks.lock().unwrap();
-            let t = ts
-                .iter_mut()
-                .find(|t| t.id == id)
-                .ok_or_else(|| "轨道不存在".to_string())?;
-            if t.downloading {
-                return Ok(());
-            }
-            t.downloading = true;
+    /// 惰性创建某轨道的临时落盘文件（幂等：已存在则跳过）�?
+    /// 路径�?download_start 一致：<save_dir>/<stamp>-<id>.tmp-part
+    fn ensure_writer(&self, id: TrackId) -> AppResult<()> {
+        if self.writer(id).is_some() {
+            return Ok(());
         }
         let dir = self.save_dir();
         let _ = std::fs::create_dir_all(&dir);
@@ -450,36 +488,54 @@ impl AppState {
             .unwrap_or_default()
             .as_millis();
         let tmp = format!("{}\\{}-{}.tmp-part", dir, stamp, id);
-        let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-        let mut writer = TrackWriter {
-            id,
+        let file = std::fs::File::create(&tmp)?;
+        let writer = TrackWriter {
             file,
-            tmp_path: tmp,
             bytes: 0,
             segments: 0,
         };
-        // 补写缓冲
-        {
-            let mut pb = self.pre_buf.lock().unwrap();
-            if let Some(buf) = pb.remove(&id) {
-                if !buf.is_empty() {
-                    use std::io::Write;
-                    let _ = writer.file.write_all(&buf);
-                    writer.bytes = buf.len() as u64;
-                    writer.segments = 0;
-                }
-            }
+        self.writers.lock().unwrap().insert(id, Arc::new(Mutex::new(writer)));
+        Ok(())
+    }
+
+    /// 取某轨道的写者引用（克隆 Arc，不长期持有全局 map 锁）�?
+    fn writer(&self, id: TrackId) -> Option<Arc<Mutex<TrackWriter>>> {
+        self.writers.lock().unwrap().get(&id).cloned()
+    }
+
+    /// 轨道结束（endOfStream�?
+    pub fn track_ended(&self, track_id: TrackId) -> AppResult<()> {
+        let mut ts = self.tracks.lock().unwrap();
+        if let Some(t) = ts.iter_mut().find(|t| t.id == track_id) {
+            t.ended = true;
         }
-        self.writers.lock().unwrap().push(writer);
+        Ok(())
+    }
+
+    /// 开始下载：标记轨道为下载中，并惰性创建临时落盘文件（若尚未因首片到达而创建）�?
+    /// 不再做任何内存缓冲补写——边下边存已保证分片始终直写磁盘�?
+    pub fn download_start(&self, track_id: &str) -> AppResult<()> {
+        let id: TrackId = track_id.parse().map_err(|_| AppError::InvalidArg("bad track id".into()))?;
+        {
+            let mut ts = self.tracks.lock().unwrap();
+            let t = ts
+                .iter_mut()
+                .find(|t| t.id == id)
+                .ok_or_else(|| AppError::NotFound("轨道不存在".into()))?;
+            if t.downloading {
+                return Ok(());
+            }
+            t.downloading = true;
+        }
+        self.ensure_writer(id)?;
         Ok(())
     }
 
     /// 停止下载：关闭文件，等待收尾
-    pub fn download_stop(&self, track_id: &str) -> Result<(), String> {
-        let id: TrackId = track_id.parse().map_err(|_| "bad track id")?;
+    pub fn download_stop(&self, track_id: &str) -> AppResult<()> {
+        let id: TrackId = track_id.parse().map_err(|_| AppError::InvalidArg("bad track id".into()))?;
         {
-            let mut ws = self.writers.lock().unwrap();
-            ws.retain(|w| w.id != id);
+            self.writers.lock().unwrap().remove(&id);
         }
         let mut ts = self.tracks.lock().unwrap();
         if let Some(t) = ts.iter_mut().find(|t| t.id == id) {
@@ -488,23 +544,22 @@ impl AppState {
         Ok(())
     }
 
-    /// 收尾：把 .tmp-part 写出最终可播放文件。
-    /// fMP4 直接按到达顺序拼接为 fragmented MP4（参考 media-sniffer-extension，
-    /// 不做 moov 重建，避免重封装出错）；mp4/ts/webm 等均按原始字节落盘。
-    /// 若仍在下载则先停止写盘，做到「一键收尾」。
-    pub fn finalize(&self, track_id: &str) -> Result<(), String> {
-        let id: TrackId = track_id.parse().map_err(|_| "bad track id")?;
-        // 若仍在下载，先关闭写盘句柄（避免半截文件），再收尾
+    /// 收尾：把 .tmp-part 写出最终可播放文件�?
+    /// fMP4 直接按到达顺序拼接为 fragmented MP4（参�?media-sniffer-extension�?
+    /// 不做 moov 重建，避免重封装出错）；mp4/ts/webm 等均按原始字节落盘�?
+    /// 若仍在下载则先停止写盘，做到「一键收尾」�?
+    pub fn finalize(&self, track_id: &str) -> AppResult<()> {
+        let id: TrackId = track_id.parse().map_err(|_| AppError::InvalidArg("bad track id".into()))?;
+        // 若仍在下载，先关闭写盘句柄（避免半截文件），再收�?
         {
-            let mut ws = self.writers.lock().unwrap();
-            ws.retain(|w| w.id != id);
+            self.writers.lock().unwrap().remove(&id);
         }
         let info = {
             let mut ts = self.tracks.lock().unwrap();
             let t = ts
                 .iter_mut()
                 .find(|t| t.id == id)
-                .ok_or_else(|| "轨道不存在".to_string())?;
+                .ok_or_else(|| AppError::NotFound("轨道不存在".into()))?;
             if t.finalized {
                 return Ok(());
             }
@@ -528,16 +583,24 @@ impl AppState {
         Ok(())
     }
 
-    fn finalize_impl(&self, info: &TrackInfo) -> Result<String, String> {
+    fn finalize_impl(&self, info: &TrackInfo) -> AppResult<String> {
         let dir = self.save_dir();
         let mut cands: Vec<std::path::PathBuf> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for e in rd.flatten() {
                 let p = e.path();
-                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                    if name.ends_with(".tmp-part") && name.contains(&format!("-{}", info.id)) {
-                        cands.push(p);
-                    }
+                let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                // 严格解析 {stamp}-{id}.tmp-part 的后段 id，避免 id=1 误收 id=12/13 的临时文件
+                let id_matches = name
+                    .strip_suffix(".tmp-part")
+                    .and_then(|stem| stem.rsplit('-').next())
+                    .and_then(|id| id.parse::<TrackId>().ok())
+                    .map(|id| id == info.id)
+                    .unwrap_or(false);
+                if id_matches {
+                    cands.push(p);
                 }
             }
         }
@@ -547,7 +610,7 @@ impl AppState {
             .ok_or_else(|| "没有可收尾的文件".to_string())?
             .clone();
 
-        // 输出文件名：自定义名优先，否则用页面标题作为默认名（再否则 kind_id）
+        // 输出文件名：自定义名优先，否则用页面标题作为默认名（再否�?kind_id�?
         let custom = self
             .name_overrides
             .lock()
@@ -558,31 +621,50 @@ impl AppState {
         let out = self.compute_out_path(info, &custom);
 
         if info.mime_family == "mp4" {
-            // 参考 media-sniffer-extension：fMP4 直接按到达顺序拼接 init + 分片，
-            // 即为合法可播放的 fragmented MP4（init 段含 moov 在前，后续为 moof/mdat），
-            // 无需重建 moov —— 避免重封装出错导致文件无法播放。
-            let mut sf = std::fs::File::open(&src).map_err(|e| e.to_string())?;
-            let mut df = std::fs::File::create(&out).map_err(|e| e.to_string())?;
-            std::io::copy(&mut sf, &mut df).map_err(|e| e.to_string())?;
+            // 优先重建索引表（fMP4 -> 标准 MP4，可拖拽 seek）
+            let ok = fmp4::finalize(&src, std::path::Path::new(&out));
+            if let Err(e) = ok {
+                // 非 fragmented / 未知结构时回退：直接拼装（不失真拷贝）
+                eprintln!("fmp4 rebuild failed, fallback to copy: {e}");
+                let mut sf = std::fs::File::open(&src)?;
+                let mut df = std::fs::File::create(&out)?;
+                std::io::copy(&mut sf, &mut df)?;
+            }
         } else {
             // webm / ts / flv / 其它：流式封装，直接拼接或改名即为可播放文件
-            if let Err(_) = std::fs::rename(&src, &out) {
-                let mut sf = std::fs::File::open(&src).map_err(|e| e.to_string())?;
-                let mut df = std::fs::File::create(&out).map_err(|e| e.to_string())?;
-                std::io::copy(&mut sf, &mut df).map_err(|e| e.to_string())?;
+            if std::fs::rename(&src, &out).is_err() {
+                let mut sf = std::fs::File::open(&src)?;
+                let mut df = std::fs::File::create(&out)?;
+                std::io::copy(&mut sf, &mut df)?;
             }
         }
-        let _ = std::fs::remove_file(&src);
+        if let Err(e) = std::fs::remove_file(&src) {
+            eprintln!("[finalize] 临时文件清理失败 {}: {e}", src.display());
+        }
         Ok(out)
     }
 
-    /// 计算某轨道的最终输出路径（含文件名 sanitize + 多轨同名词后缀 + 扩展名）
+    /// 计算某轨道的最终输出路径（含文件名 sanitize + 多轨同名词后缀 + 扩展名）�?
+    /// 基础名优先级：项目级更名(project_overrides) > 逐轨更名(custom) > 默认标题�?
+    /// 同一项目更名会让该项目的 video.mp4 �?audio.m4a 共用一个基础名，达到“按项目更名”�?
     fn compute_out_path(&self, info: &TrackInfo, custom: &str) -> String {
-        let base = if custom.trim().is_empty() {
-            Self::default_base_of(info)
-        } else {
+        let proj_name = self
+            .project_overrides
+            .lock()
+            .unwrap()
+            .get(&info.project)
+            .cloned()
+            .unwrap_or_default();
+        let base = if !proj_name.trim().is_empty() {
+            proj_name.trim().to_string()
+        } else if !custom.trim().is_empty() {
             custom.trim().to_string()
+        } else {
+            Self::default_base_of(info)
         };
+        // 基础名过长会撞上 Windows MAX_PATH(260)：按字符数截断 stem，
+        // 留足 save_dir + 后缀 + 扩展名 的空间（截断发生在 sanitize 之后，保证是合法字边界）
+        const MAX_STEM_CHARS: usize = 120;
         let sanitized: String = base
             .chars()
             .map(|c| match c {
@@ -590,11 +672,12 @@ impl AppState {
                 c if (c as u32) < 32 => '_',
                 c => c,
             })
+            .take(MAX_STEM_CHARS)
             .collect();
-        // 按文件类型分别决定扩展名（参考 media-sniffer-extension 的 MIME->ext 映射）：
-        //   mp4 族：视频 -> .mp4，音频 -> .m4a（修复音视频同名 .mp4 互相覆盖的 bug）
+        // 按文件类型分别决定扩展名（参�?media-sniffer-extension �?MIME->ext 映射）：
+        //   mp4 族：视频 -> .mp4，音�?-> .m4a（修复音视频同名 .mp4 互相覆盖�?bug�?
         //   webm 族：统一 .webm
-        //   其它：沿用探测到的 ext（ts / flv / mp3 ...），空则回退 .bin
+        //   其它：沿用探测到�?ext（ts / flv / mp3 ...），空则回退 .bin
         let out_ext = if info.mime_family == "mp4" {
             if info.kind == "audio" {
                 "m4a"
@@ -608,20 +691,23 @@ impl AppState {
         } else {
             "bin"
         };
-        // 同类型(kind)同基础名存在多条轨道时追加 _video1/_audio1 后缀，避免覆盖
-        // （沿用 media-sniffer-extension 的多轨命名规则）
+        // 同类�?kind)同基础名存在多条轨道时追加 _video1/_audio1 后缀，避免覆�?
+        // （沿�?media-sniffer-extension 的多轨命名规则）。基础名判定同时考虑项目级更名�?
         let mut ids: Vec<TrackId> = Vec::new();
         {
             let ts = self.tracks.lock().unwrap();
             let no = self.name_overrides.lock().unwrap();
+            let po = self.project_overrides.lock().unwrap();
             for t in ts.iter() {
                 if t.kind == info.kind {
-                    let c = no.get(&t.id.to_string()).cloned().unwrap_or_default();
-                    let tb = if c.trim().is_empty() {
-                        Self::default_base_of(t)
-                    } else {
-                        c.trim().to_string()
-                    };
+                    let tb = po
+                        .get(&t.project)
+                        .cloned()
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| {
+                            no.get(&t.id.to_string()).cloned().filter(|s| !s.trim().is_empty())
+                        })
+                        .unwrap_or_else(|| Self::default_base_of(t));
                     if tb == base {
                         ids.push(t.id);
                     }
@@ -646,18 +732,17 @@ impl AppState {
         self.auto.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// 该轨道是否仍在下载
+    /// 该轨道是否仍在下�?
     pub fn is_downloading(&self, track_id: TrackId) -> bool {
         let ts = self.tracks.lock().unwrap();
         ts.iter().any(|t| t.id == track_id && t.downloading)
     }
 
-    /// 轨道结束后（endOfStream）自动收尾：先停写，再写出最终可播放文件。
-    /// 由 httpd 在独立线程延迟调用，做到「捕获完即自动产出可播放文件」。
+    /// 轨道结束后（endOfStream）自动收尾：先停写，再写出最终可播放文件�?
+    /// �?httpd 在独立线程延迟调用，做到「捕获完即自动产出可播放文件」�?
     pub fn auto_finalize(&self, track_id: TrackId) {
         {
-            let mut ws = self.writers.lock().unwrap();
-            ws.retain(|w| w.id != track_id);
+            self.writers.lock().unwrap().remove(&track_id);
         }
         let info = {
             let mut ts = self.tracks.lock().unwrap();
@@ -683,7 +768,7 @@ impl AppState {
         }
     }
 
-    /// 轮询快照（UI 每次 setInterval 调用）
+    /// 轮询快照（UI 每次 setInterval 调用�?
     pub fn snapshot(&self) -> serde_json::Value {
         let ts = self.tracks.lock().unwrap();
         let ds = self.directs.lock().unwrap();
@@ -692,7 +777,7 @@ impl AppState {
         let tracks: Vec<serde_json::Value> = ts
             .iter()
             .map(|t| {
-                let w = ws.iter().find(|w| w.id == t.id);
+                let w = ws.get(&t.id).map(|w| w.lock().unwrap());
                 json!({
                     "id": t.id,
                     "kind": t.kind,
@@ -700,15 +785,31 @@ impl AppState {
                     "ext": t.ext,
                     "started": t.started,
                     "ended": t.ended,
-                    "bytes": w.map(|w| w.bytes).unwrap_or(t.bytes),
-                    "segments": w.map(|w| w.segments).unwrap_or(t.segments),
+                    "bytes": w.as_ref().map(|w| w.bytes).unwrap_or(t.bytes),
+                    "segments": w.as_ref().map(|w| w.segments).unwrap_or(t.segments),
                     "downloading": t.downloading,
                     "finalizing": t.finalizing,
                     "finalized": t.finalized,
                     "outPath": t.out_path,
                     "mimeFamily": t.mime_family,
                     "title": t.title,
-                    "name": self.name_overrides.lock().unwrap().get(&t.id.to_string()).cloned().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| t.title.clone()),
+                    "project": t.project,
+                    "name": self
+                        .name_overrides
+                        .lock()
+                        .unwrap()
+                        .get(&t.id.to_string())
+                        .cloned()
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| {
+                            self.project_overrides
+                                .lock()
+                                .unwrap()
+                                .get(&t.project)
+                                .cloned()
+                                .filter(|s| !s.trim().is_empty())
+                        })
+                        .unwrap_or_else(|| t.title.clone()),
                 })
             })
             .collect();
@@ -739,6 +840,7 @@ impl AppState {
             "auto": self.auto.load(std::sync::atomic::Ordering::Relaxed),
             "copyUnlock": self.copy_unlock.load(std::sync::atomic::Ordering::Relaxed),
             "mux": self.mux.load(std::sync::atomic::Ordering::Relaxed),
+            "muxHint": self.mux_hint.lock().unwrap().clone(),
             "saveDir": self.save_dir(),
             "tracks": tracks,
             "directs": directs,
@@ -747,8 +849,8 @@ impl AppState {
         })
     }
 
-    pub fn set_name(&self, track_id: &str, name: String) -> Result<(), String> {
-        let id: TrackId = track_id.parse().map_err(|_| "bad track id".to_string())?;
+    pub fn set_name(&self, track_id: &str, name: String) -> AppResult<()> {
+        let id: TrackId = track_id.parse().map_err(|_| AppError::InvalidArg("bad track id".into()))?;
         let custom = name.trim().to_string();
         {
             let mut m = self.name_overrides.lock().unwrap();
@@ -759,7 +861,7 @@ impl AppState {
                 m.insert(k, custom.clone());
             }
         }
-        // 若已收尾（文件已落盘），直接把磁盘文件改名为新名，让重命名立即生效
+        // 若已收尾（文件已落盘），直接把磁盘文件改名为新名，让重命名立即生�?
         let info = {
             let ts = self.tracks.lock().unwrap();
             ts.iter().find(|t| t.id == id).cloned()
@@ -784,8 +886,46 @@ impl AppState {
         Ok(())
     }
 
-    /// hook 上报直链媒体（去重：同 URL + 同 type 只保留一次）
-    pub fn add_media_report(&self, rep: &serde_json::Value) -> Result<(), String> {
+    /// 按项目更名：同一 project（默�?页面标题）下�?video/audio 轨道共用一个基础名�?
+    /// 已收尾的轨道随即把磁盘文件改名为新名，使“一次更名、视频与音频一并改”立即生效�?
+    pub fn set_name_by_project(&self, project: &str, name: String) -> AppResult<()> {
+        let custom = name.trim().to_string();
+        {
+            let mut m = self.project_overrides.lock().unwrap();
+            if custom.is_empty() {
+                m.remove(project);
+            } else {
+                m.insert(project.to_string(), custom.clone());
+            }
+        }
+        // 已收尾的同一项目轨道：立即按新名重命名磁盘文�?
+        let infos: Vec<TrackInfo> = {
+            let ts = self.tracks.lock().unwrap();
+            ts.iter()
+                .filter(|t| t.project == project && t.finalized)
+                .cloned()
+                .collect()
+        };
+        for t in infos {
+            if let Some(old) = t.out_path.clone() {
+                let new_path = self.compute_out_path(&t, "");
+                if !custom.is_empty() && new_path != old {
+                    if let Some(parent) = std::path::Path::new(&new_path).parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::rename(&old, &new_path);
+                    let mut ts = self.tracks.lock().unwrap();
+                    if let Some(tt) = ts.iter_mut().find(|x| x.id == t.id) {
+                        tt.out_path = Some(new_path);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// hook 上报直链媒体（去重：�?URL + �?type 只保留一次）
+    pub fn add_media_report(&self, rep: &serde_json::Value) -> AppResult<()> {
         let url = rep["url"].as_str().unwrap_or("").to_string();
         let mtype = rep["type"].as_str().unwrap_or("").to_string();
         let mut rs = self.reports.lock().unwrap();
@@ -798,7 +938,7 @@ impl AppState {
         Ok(())
     }
 
-    /// hook 自上报的诊断信息（是否已注入、是否进入 iframe、未识别字节等）
+    /// hook 自上报的诊断信息（是否已注入、是否进�?iframe、未识别字节等）
     pub fn set_hook_diag(&self, diag: &serde_json::Value) {
         let mut d = self.hook_diag.lock().unwrap();
         *d = diag.clone();
@@ -813,17 +953,45 @@ fn default_base_of(t: &TrackInfo) -> String {
     }
 }
 
-/// mkvmerge 可执行文件路径：<exe_dir>/tools/mkvmerge.exe（与绿色 exe 同目录下的 tools 子目录）
-fn mkvmerge_path() -> std::path::PathBuf {
-    AppState::exe_dir().join("tools").join("mkvmerge.exe")
+/// 混流工具可执行文件查找：<exe_dir>/tools、<exe_dir>、当前目录、仓库根 tools、PATH
+    fn find_tool(name: &str) -> Option<std::path::PathBuf> {
+    let mut cands: Vec<std::path::PathBuf> = Vec::new();
+    let exe_dir = AppState::exe_dir();
+    cands.push(exe_dir.join("tools").join(name));
+    cands.push(exe_dir.join(name));
+    if let Ok(cwd) = std::env::current_dir() {
+        // 开发态：cargo 构建时 cwd 为仓库根，tools/ 常在仓库根（与 exe 同目录的预期不一致，
+        // 作为开发期回退），运行期 exe_dir 优先。
+        cands.push(cwd.join("tools").join(name));
+        cands.push(cwd.join(name));
+    }
+    for c in cands {
+        if c.is_file() {
+            return Some(c);
+        }
+    }
+    // PATH 兜底：脚本/系统安装的 ffmpeg 可直接使用
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let c = dir.join(name);
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+    }
+    None
 }
 
-/// ffmpeg 可执行文件路径：<exe_dir>/tools/ffmpeg.exe（混流优先方案）
-fn ffmpeg_path() -> std::path::PathBuf {
-    AppState::exe_dir().join("tools").join("ffmpeg.exe")
-}
+/// 选择混流工具：ffmpeg 优先（更稳地解析 fragmented MP4），缺失回退 mkvmerge
+    fn pick_mux_tool() -> Option<(std::path::PathBuf, bool)> {
+        if let Some(p) = Self::find_tool("ffmpeg.exe") {
+            Some((p, true))
+        } else {
+            Self::find_tool("mkvmerge.exe").map(|p| (p, false))
+        }
+    }
 
-/// 文件名 sanitize（与 compute_out_path 规则一致）
+/// 文件�?sanitize（与 compute_out_path 规则一致）
 fn sanitize_name(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -834,7 +1002,7 @@ fn sanitize_name(s: &str) -> String {
         .collect()
 }
 
-// ---------------- mp4 首帧时间戳解析（zero-dep，用于 mkvmerge 零点对齐） ----------------
+// ---------------- mp4 首帧时间戳解析（zero-dep，用�?mkvmerge 零点对齐�?----------------
 fn be_u32(b: &[u8], p: usize) -> u32 {
     ((b[p] as u32) << 24) | ((b[p + 1] as u32) << 16) | ((b[p + 2] as u32) << 8) | (b[p + 3] as u32)
 }
@@ -844,7 +1012,7 @@ fn be_u64(b: &[u8], p: usize) -> u64 {
 const MP4_CONTAINERS: [&[u8; 4]; 11] = [
     b"moov", b"trak", b"mdia", b"minf", b"stbl", b"traf", b"moof", b"dinf", b"edts", b"mvex", b"udta",
 ];
-/// 深度优先查找第一个匹配 type 的 box（返回含 size+type 的整段切片，offset 相对该切片）
+/// 深度优先查找第一个匹�?type �?box（返回含 size+type 的整段切片，offset 相对该切片）
 fn find_box<'a>(d: &'a [u8], typ: &[u8; 4]) -> Option<&'a [u8]> {
     let mut i = 0;
     while i + 8 <= d.len() {
@@ -865,7 +1033,7 @@ fn find_box<'a>(d: &'a [u8], typ: &[u8; 4]) -> Option<&'a [u8]> {
     }
     None
 }
-/// 从 moov→trak→mdia→mdhd 读轨道 timescale（mdhd 的 timescale 字段）
+/// �?moov→trak→mdia→mdhd 读轨�?timescale（mdhd �?timescale 字段�?
 fn find_mdhd_timescale(d: &[u8]) -> Option<u32> {
     let mdhd = Self::find_box(d, b"mdhd")?;
     let p = 8; // size(4) + type(4)
@@ -879,7 +1047,7 @@ fn find_mdhd_timescale(d: &[u8]) -> Option<u32> {
         None
     }
 }
-/// 从第一个 moof→traf→tfdt 读 base_media_decode_time（绝对解码时间）
+/// 从第一�?moof→traf→tfdt �?base_media_decode_time（绝对解码时间）
 fn find_first_tfdt(d: &[u8]) -> Option<u64> {
     let tfdt = Self::find_box(d, b"tfdt")?;
     let p = 8; // size + type
@@ -899,9 +1067,18 @@ fn find_first_tfdt(d: &[u8]) -> Option<u64> {
         }
     }
 }
-/// 该 mp4 文件首帧的绝对时间（秒），用于两轨零点对齐
+/// 从 mp4 文件首帧的绝对时间（秒），用于两轨零点对齐。
+/// 只读文件头部（ftyp+moov+首个 moof 均在文件前部），不整文件入内存：
+/// 大视频（GB 级）全读会撑爆内存，且只为读几个字段完全不必要。
 fn mp4_first_frame_sec(path: &str) -> Option<f64> {
-    let data = std::fs::read(path).ok()?;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    // 只读前 16MB：通常 ftyp+moov+首个 moof 都在这；不足则读完整文件
+    let head_len = (len.min(16 * 1024 * 1024)) as usize;
+    let mut data = vec![0u8; head_len];
+    f.seek(SeekFrom::Start(0)).ok()?;
+    f.read_exact(&mut data).ok()?;
     let ts = Self::find_mdhd_timescale(&data)? as f64;
     let base = Self::find_first_tfdt(&data)?;
     if ts <= 0.0 {
@@ -910,18 +1087,102 @@ fn mp4_first_frame_sec(path: &str) -> Option<f64> {
     Some(base as f64 / ts)
 }
 
-/// 调用 mkvmerge 将视频轨与音频轨混流为单个 mkv 文件
+/// 读取 MP4/M4A 的播放时长（秒），通过解析 stts 累计 sample duration
+/// 比 mvhd.duration 更可靠：fMP4 的 mvhd duration 通常为 0，
+/// 而 stts 是样本实际时间戳表，finalize 后会正确填充
+fn mp4_duration_sec(path: &str) -> Option<f64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let head_len = (len.min(16 * 1024 * 1024)) as usize;
+    let mut data = vec![0u8; head_len];
+    f.seek(SeekFrom::Start(0)).ok()?;
+    f.read_exact(&mut data).ok()?;
+    // 找 stts box 并解析 sample_time_to_sample 表
+    let mut pos = 0;
+    while pos + 8 <= data.len() {
+        let size = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+        let typ = &data[pos + 4..pos + 8];
+        if typ == b"stts" {
+            let content_start = pos + 8;
+            if content_start + 8 <= data.len() {
+                let _ver_flags = u32::from_be_bytes(data[content_start..content_start + 4].try_into().ok()?);
+                let entry_count = u32::from_be_bytes(data[content_start + 4..content_start + 8].try_into().ok()?) as usize;
+                let mut total_dur = 0u64;
+                let ts = 0u32;
+                let mut sample_count = 0u64;
+                let mut entry_off = content_start + 8;
+                for _ in 0..entry_count.min(100_000) {
+                    if entry_off + 8 > data.len() { break; }
+                    let count = u32::from_be_bytes(data[entry_off..entry_off + 4].try_into().ok()?) as usize;
+                    let duration = u32::from_be_bytes(data[entry_off + 4..entry_off + 8].try_into().ok()?);
+                    if duration == 0 { break; }
+                    total_dur = total_dur.saturating_add((count as u64) * (duration as u64));
+                    sample_count = sample_count.saturating_add(count as u64);
+                    entry_off += 8;
+                    if count >= 100_000 { break; } // 防溢出
+                }
+                if sample_count > 0 && ts > 0 {
+                    return Some(total_dur as f64 / ts as f64);
+                }
+            }
+            break;
+        }
+        if size < 8 { break; }
+        pos += size;
+    }
+    // 回退：尝试读 mdhd duration（trak 内）
+    pos = 0;
+    while pos + 8 <= data.len() {
+        let size = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+        let typ = &data[pos + 4..pos + 8];
+        if typ == b"mdhd" {
+            let content_start = pos + 8;
+            if content_start + 20 <= data.len() {
+                let ver = data[content_start];
+                let (timescale_off, dur_off) = if ver == 1 { (24, 28) } else { (12, 16) };
+                if content_start + dur_off + 4 <= data.len() {
+                    let timescale = u32::from_be_bytes(data[content_start + timescale_off..content_start + timescale_off + 4].try_into().ok()?) ;
+                    let duration = u32::from_be_bytes(data[content_start + dur_off..content_start + dur_off + 4].try_into().ok()?) ;
+                    if timescale > 0 && duration > 0 {
+                        return Some(duration as f64 / timescale as f64);
+                    }
+                }
+            }
+            break;
+        }
+        if size < 8 { break; }
+        pos += size;
+    }
+    None
+}
+
+/// 调用 mkvmerge 将视频轨与音频轨混流为单�?mkv 文件
 ///
-/// 零点对齐：绝对 tfdt 站点因 hook 注入前漏录开头分片，两轨首帧时间戳可能不同
-/// （如 video 从 0、audio 从 N 秒）。把较晚的轨整体前移 |diff| 秒使其与较早轨起点
-/// 对齐，消除固定偏移不同步。假设 video.mp4 的 video 轨源 TID=1、audio.m4a 的
-/// audio 轨源 TID=1（单轨文件常态）。相对 tfdt 站点（两轨首帧均 0）无差，--sync 不加。
+/// 零点对齐：绝�?tfdt 站点�?hook 注入前漏录开头分片，两轨首帧时间戳可能不�?
+/// （如 video �?0、audio �?N 秒）。把较晚的轨整体前移 |diff| 秒使其与较早轨起�?
+/// 对齐，消除固定偏移不同步。假�?video.mp4 �?video 轨源 TID=1、audio.m4a �?
+/// audio 轨源 TID=1（单轨文件常态）。相�?tfdt 站点（两轨首帧均 0）无差，--sync 不加�?
 fn run_mux(
     mkv: &std::path::Path,
     video: &str,
     audio: &str,
     out: &std::path::Path,
-) -> Result<(), String> {
+) -> AppResult<()> {
+    // 时长一致性校验：同 ffmpeg 路径
+    let v_dur = Self::mp4_duration_sec(video);
+    let a_dur = Self::mp4_duration_sec(audio);
+    if let (Some(v), Some(a)) = (v_dur, a_dur) {
+        let diff = (v - a).abs();
+        let avg = (v + a) / 2.0;
+        if avg > 1.0 && diff / avg > 0.015 {
+            return Err(AppError::MuxFailed(format!(
+                "音视频时长差异过大 (video={:.2}s, audio={:.2}s, diff={:.1}%)，拒绝混流以防止渐进漂移。",
+                v, a, diff / avg * 100.0
+            )));
+        }
+    }
+
     let out_s = out.to_string_lossy().to_string();
     let mut cmd = std::process::Command::new(mkv);
     cmd.arg("-o").arg(&out_s);
@@ -942,29 +1203,44 @@ fn run_mux(
     }
     let status = cmd
         .output()
-        .map_err(|e| format!("启动 mkvmerge 失败：{}", e))?;
+        .map_err(|e| AppError::MuxFailed(format!("启动 mkvmerge 失败：{}", e)))?;
     if status.status.success() {
         Ok(())
     } else {
         let code = status.status.code().unwrap_or(-1);
         let err = String::from_utf8_lossy(&status.stderr).trim().to_string();
-        Err(format!("mkvmerge 失败(退出码 {})：{}", code, err))
+        Err(AppError::MuxFailed(format!("mkvmerge 失败(退出码 {})：{}", code, err)))
     }
 }
 
-/// 用 ffmpeg 将 video+audio 混流为单个 mkv（优先方案）。
-/// 依据两轨首帧绝对时间差，用 -itsoffset 把 audio 的时间原点对齐到 video，
-/// 解决 fragmented MP4 两轨零点错位导致的不同步；-c copy 不重编码、仅换封装。
+/// �?ffmpeg �?video+audio 混流为单�?mkv（优先方案）�?
+/// 依据两轨首帧绝对时间差，�?-itsoffset �?audio 的时间原点对齐到 video�?
+/// 解决 fragmented MP4 两轨零点错位导致的不同步�?c copy 不重编码、仅换封装�?
+/// 新增：时长一致性校验（差 > 1.5% 拒绝混流），避免渐进漂移；加固参数防止 non-monotonic 导致丢帧
 fn run_mux_ffmpeg(
     ffmpeg: &std::path::Path,
     video: &str,
     audio: &str,
     out: &std::path::Path,
-) -> Result<(), String> {
+) -> AppResult<()> {
+    // 时长一致性校验：读取两轨 mvhd duration（精确到 ms），差 > 1.5% 直接拒绝
+    let v_dur = Self::mp4_duration_sec(video);
+    let a_dur = Self::mp4_duration_sec(audio);
+    if let (Some(v), Some(a)) = (v_dur, a_dur) {
+        let diff = (v - a).abs();
+        let avg = (v + a) / 2.0;
+        if avg > 1.0 && diff / avg > 0.015 {
+            return Err(AppError::MuxFailed(format!(
+                "音视频时长差异过大 (video={:.2}s, audio={:.2}s, diff={:.1}%)，拒绝混流以防止渐进漂移。请检查源流是否完整或手动收尾。",
+                v, a, diff / avg * 100.0
+            )));
+        }
+    }
+
     let out_s = out.to_string_lossy().to_string();
     let mut cmd = std::process::Command::new(ffmpeg);
     cmd.arg("-y").arg("-i").arg(video);
-    // 两轨首帧绝对时间差（秒）；把 audio 的时间原点拉到 video 时间原点
+    // 两轨首帧绝对时间差（秒）；把 audio 的时间原点拉�?video 时间原点
     let shift = Self::mp4_first_frame_sec(video).unwrap_or(0.0)
         - Self::mp4_first_frame_sec(audio).unwrap_or(0.0);
     if shift.abs() > 0.05 {
@@ -980,33 +1256,45 @@ fn run_mux_ffmpeg(
         .arg("copy")
         .arg("-fflags")
         .arg("+genpts")
+        // 防御性参数：避免负/回退时间戳导致丢帧/漂移
+        .arg("-avoid_negative_ts")
+        .arg("make_zero")
+        .arg("-copytb")
+        .arg("0")
+        .arg("-max_interleave_delta")
+        .arg("100M")
+        // 以较短轨道为基准截断，防止音频超前/滞后导致后半段不同步
+        .arg("-shortest")
         .arg(&out_s);
     let status = cmd
         .output()
-        .map_err(|e| format!("启动 ffmpeg 失败：{}", e))?;
+        .map_err(|e| AppError::MuxFailed(format!("启动 ffmpeg 失败：{}", e)))?;
     if status.status.success() {
         Ok(())
     } else {
         let code = status.status.code().unwrap_or(-1);
         let err = String::from_utf8_lossy(&status.stderr).trim().to_string();
-        Err(format!("ffmpeg 失败(退出码 {})：{}", code, err))
+        Err(AppError::MuxFailed(format!("ffmpeg 失败(退出码 {})：{}", code, err)))
     }
 }
 
-    pub fn clear_all(&self) -> Result<(), String> {
+    pub fn clear_all(&self) -> AppResult<()> {
         self.writers.lock().unwrap().clear();
         self.tracks.lock().unwrap().clear();
-        self.pre_buf.lock().unwrap().clear();
         self.name_overrides.lock().unwrap().clear();
+        self.project_overrides.lock().unwrap().clear();
         self.directs.lock().unwrap().clear();
+        self.reports.lock().unwrap().clear();
+        *self.mux_hint.lock().unwrap() = String::new();
+        *self.hook_diag.lock().unwrap() = serde_json::json!({});
         Ok(())
     }
 
-    // ---------- 直链下载（普通 http 视频） ----------
+    // ---------- 直链下载（普�?http 视频�?----------
 
-    /// 注册直链任务（实际下载在命令层 spawn 线程执行）
-    pub fn direct_register(&self, id: &str, url: &str, name: &str) -> Result<(), String> {
-        let id: DirectId = id.parse().map_err(|_| "bad direct id")?;
+    /// 注册直链任务（实际下载在命令�?spawn 线程执行�?
+    pub fn direct_register(&self, id: &str, url: &str, name: &str) -> AppResult<()> {
+        let id: DirectId = id.parse().map_err(|_| AppError::InvalidArg("bad direct id".into()))?;
         let mut ds = self.directs.lock().unwrap();
         if let Some(d) = ds.iter_mut().find(|d| d.id == id) {
             if d.downloading {
@@ -1036,8 +1324,8 @@ fn run_mux_ffmpeg(
         Ok(())
     }
 
-    pub fn direct_stop(&self, id: &str) -> Result<(), String> {
-        let id: DirectId = id.parse().map_err(|_| "bad direct id")?;
+    pub fn direct_stop(&self, id: &str) -> AppResult<()> {
+        let id: DirectId = id.parse().map_err(|_| AppError::InvalidArg("bad direct id".into()))?;
         let mut ds = self.directs.lock().unwrap();
         if let Some(d) = ds.iter_mut().find(|d| d.id == id) {
             d.aborted = true;
@@ -1045,3 +1333,5 @@ fn run_mux_ffmpeg(
         Ok(())
     }
 }
+
+

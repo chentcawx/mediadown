@@ -4,12 +4,16 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build:hook": "esbuild src-tauri/hook-ts/index.ts --bundle --format=iife --target=es2017 --outfile=src-tauri/src/hook.js",
+    "check:hook": "tsc -p src-tauri/hook-ts"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "devDependencies": {
-    "@tauri-apps/cli": "^2.11.4"
+    "@tauri-apps/cli": "^2.11.4",
+    "esbuild": "^0.28.1",
+    "typescript": "^7.0.2"
   }
 }

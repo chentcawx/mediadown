@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+mod error;
+use crate::error::{AppError, AppResult};
 use tauri::{Emitter, Manager, WindowEvent};
 
 mod direct;
@@ -12,6 +14,7 @@ use state::AppState;
 
 /// 原生 Windows 文件夹选择对话框（用于“选择保存目录”，无需额外依赖）
 #[cfg(target_os = "windows")]
+#[allow(clippy::upper_case_acronyms)] // FFI 类型名沿用 Windows SDK 命名
 mod filedlg {
     use std::os::windows::ffi::OsStringExt;
     use std::ptr;
@@ -186,10 +189,10 @@ fn print_help() {
 
 /// 导航到目标站点（点击地址栏"打开"或状态栏地址）
 #[tauri::command]
-fn navigate_to(app: tauri::AppHandle, url: String) -> Result<(), String> {
+fn navigate_to(app: tauri::AppHandle, url: String) -> AppResult<()> {
     let trimmed = url.trim().to_string();
     if trimmed.is_empty() {
-        return Err("地址不能为空".into());
+        return Err(AppError::InvalidArg("地址不能为空".into()));
     }
     let full = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         trimmed
@@ -198,23 +201,22 @@ fn navigate_to(app: tauri::AppHandle, url: String) -> Result<(), String> {
     };
     let webview = app
         .get_webview("browser")
-        .ok_or_else(|| "浏览器 webview 未初始化".to_string())?;
+        .ok_or_else(|| AppError::NotFound("浏览器 webview 未初始化".into()))?;
     webview
-        .navigate(full.parse::<url::Url>().map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+        .navigate(full.parse::<url::Url>()?)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(())
 }
 
 /// 打开本地保存目录（explorer）
 #[tauri::command]
-fn open_save_dir(app: tauri::AppHandle) -> Result<(), String> {
+fn open_save_dir(app: tauri::AppHandle) -> AppResult<()> {
     let state = app.state::<Arc<AppState>>();
     let dir = state.save_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir)?;
     std::process::Command::new("explorer")
         .arg(&dir)
-        .spawn()
-        .map_err(|e| e.to_string())?;
+        .spawn()?;
     Ok(())
 }
 
@@ -225,7 +227,7 @@ fn open_save_dir(app: tauri::AppHandle) -> Result<(), String> {
 /// 需要通过主线程泵消息来完成跨线程 COM 封送，于是死锁表现为“点修改目录卡死程序”。
 /// 改为异步后，主线程（异步运行时）在 await 期间不被阻塞，对话框 owner 可正常响应。
 #[tauri::command]
-async fn pick_save_dir(app: tauri::AppHandle) -> Result<String, String> {
+async fn pick_save_dir(app: tauri::AppHandle) -> AppResult<String> {
     #[cfg(target_os = "windows")]
     {
         // 取主窗口 HWND 作为对话框父窗口，确保置顶可见
@@ -243,13 +245,13 @@ async fn pick_save_dir(app: tauri::AppHandle) -> Result<String, String> {
                 state.set_save_dir(&p)?;
                 Ok(state.save_dir())
             }
-            None => Err("未选择目录".into()),
+            None => Err(AppError::InvalidArg("未选择目录".into())),
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
         let _ = app;
-        Err("当前平台不支持目录选择".into())
+        Err(AppError::InvalidArg("当前平台不支持目录选择".into()))
     }
 }
 
@@ -262,15 +264,22 @@ fn get_state(app: tauri::AppHandle) -> serde_json::Value {
 
 /// 设置自定义文件名（trackId -> name）
 #[tauri::command]
-fn set_name(app: tauri::AppHandle, track_id: String, name: String) -> Result<(), String> {
+fn set_name(app: tauri::AppHandle, track_id: String, name: String) -> AppResult<()> {
     let state = app.state::<Arc<AppState>>();
     state.set_name(&track_id, name)
+}
+
+/// 按项目整体更名（project -> name），同一项目的 video/audio 一并改并重命名磁盘文件
+#[tauri::command]
+fn set_project_name(app: tauri::AppHandle, project: String, name: String) -> AppResult<()> {
+    let state = app.state::<Arc<AppState>>();
+    state.set_name_by_project(&project, name)
 }
 
 /// 设置倍速（影响 video.playbackRate）—— 同时广播 md-rate 事件，
 /// 让注入目标站的 hook.js 立即把新倍速应用到正在播放的 <video>。
 #[tauri::command]
-fn set_rate(app: tauri::AppHandle, rate: f64) -> Result<(), String> {
+fn set_rate(app: tauri::AppHandle, rate: f64) -> AppResult<()> {
     let state = app.state::<Arc<AppState>>();
     state.set_rate(rate)?;
     let _ = app.emit("md-rate", rate);
@@ -279,34 +288,34 @@ fn set_rate(app: tauri::AppHandle, rate: f64) -> Result<(), String> {
 
 /// 插件总开关
 #[tauri::command]
-fn set_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+fn set_enabled(app: tauri::AppHandle, enabled: bool) -> AppResult<()> {
     let state = app.state::<Arc<AppState>>();
     state.set_enabled(enabled)
 }
 
 /// 自动下载开关（捕获到轨道后自动开始）
 #[tauri::command]
-fn set_auto(app: tauri::AppHandle, auto: bool) -> Result<(), String> {
+fn set_auto(app: tauri::AppHandle, auto: bool) -> AppResult<()> {
     let state = app.state::<Arc<AppState>>();
     state.set_auto(auto)
 }
 
 /// 解除复制限制开关（user-select / 右键 / 复制 / 选择 拦截）
 #[tauri::command]
-fn set_copy_unlock(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+fn set_copy_unlock(app: tauri::AppHandle, enabled: bool) -> AppResult<()> {
     let state = app.state::<Arc<AppState>>();
     state.set_copy_unlock(enabled)
 }
 
 /// 下载后自动调用 tools/mkvmerge.exe 混流（video+audio -> mkv）开关
 #[tauri::command]
-fn set_mux(app: tauri::AppHandle, mux: bool) -> Result<(), String> {
+fn set_mux(app: tauri::AppHandle, mux: bool) -> AppResult<()> {
     app.state::<Arc<AppState>>().set_mux(mux)
 }
 
 /// 启动 / 停止下载某条轨道（边下边存，文件持续增长）
 #[tauri::command]
-fn download_track(app: tauri::AppHandle, track_id: String, start: bool) -> Result<(), String> {
+fn download_track(app: tauri::AppHandle, track_id: String, start: bool) -> AppResult<()> {
     let state = app.state::<Arc<AppState>>();
     if start {
         state.download_start(&track_id)
@@ -317,14 +326,14 @@ fn download_track(app: tauri::AppHandle, track_id: String, start: bool) -> Resul
 
 /// 将已结束的轨道收尾为标准 MP4（重建索引表）
 #[tauri::command]
-fn finalize_track(app: tauri::AppHandle, track_id: String) -> Result<(), String> {
+fn finalize_track(app: tauri::AppHandle, track_id: String) -> AppResult<()> {
     let state = app.state::<Arc<AppState>>();
     state.finalize(&track_id)
 }
 
 /// 重置全部（清空会话）
 #[tauri::command]
-fn clear_all(app: tauri::AppHandle) -> Result<(), String> {
+fn clear_all(app: tauri::AppHandle) -> AppResult<()> {
     let state = app.state::<Arc<AppState>>();
     state.clear_all()
 }
@@ -337,17 +346,17 @@ fn direct_download(
     url: String,
     name: String,
     start: bool,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let state = app.state::<Arc<AppState>>();
     if start {
-        let id_u64: u64 = id.parse().map_err(|_| "bad direct id")?;
+        let id_u64: u64 = id.parse().map_err(|_| AppError::InvalidArg("bad direct id".into()))?;
         state.direct_register(&id, &url, &name)?;
         let arc = Arc::clone(&state);
         std::thread::spawn(move || {
             if let Err(e) = direct::run_direct(&arc, id_u64, &url, &name) {
                 let mut ds = arc.directs.lock().unwrap();
                 if let Some(d) = ds.iter_mut().find(|d| d.id == id_u64) {
-                    d.error = Some(e);
+                    d.error = Some(e.to_string());
                     d.downloading = false;
                 }
             }
@@ -367,6 +376,7 @@ fn main() {
             pick_save_dir,
             get_state,
             set_name,
+            set_project_name,
             set_rate,
             set_enabled,
             set_auto,

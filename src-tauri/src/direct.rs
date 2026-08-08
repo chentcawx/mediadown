@@ -10,8 +10,8 @@ pub fn run_direct(state: &AppState, id: u64, url: &str, name: &str) -> Result<()
     let dir = state.save_dir();
     let _ = std::fs::create_dir_all(&dir);
     let base = sanitize(name);
-    let ext = guess_ext(url, &base);
-    let tmp = format!("{}\\{}.part", dir, base);
+    let ext = guess_ext(url);
+    let tmp = format!("{}\\{}-{}.part", dir, base, id); // 临时文件带任务 id，避免同名任务并发共写同一 .part
     let out = format!("{}\\{}.{}", dir, base, ext);
 
     let client = reqwest::blocking::Client::builder()
@@ -23,62 +23,65 @@ pub fn run_direct(state: &AppState, id: u64, url: &str, name: &str) -> Result<()
     // 已下载多少（续传）
     let mut existing = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
 
-    loop {
-        if is_aborted(state, id) {
-            finish(state, id, &out, &tmp, true);
-            return Ok(());
-        }
-        let mut req = client.get(url);
-        if existing > 0 {
-            req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing));
-        }
-        let resp = req.send().map_err(|e| e.to_string())?;
-        if resp.status().is_redirection() {
-            return Err("重定向过多".into());
-        }
-        if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
-            || resp.status() == reqwest::StatusCode::OK
-        {
-            // 记录总量
-            let total = resp
-                .headers()
-                .get(reqwest::header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok());
-            if existing == 0 {
-                if let Some(t) = total {
-                    set_total(state, id, existing + t);
-                }
+    // 单次请求流程：断点续传只需一个 Range 请求，服务器忽略 Range 时
+    // 自然退化为整体下载，无需外层重试循环。
+    if is_aborted(state, id) {
+        finish(state, id, &out, &tmp, true);
+        return Ok(());
+    }
+    let mut req = client.get(url);
+    if existing > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing));
+    }
+    let resp = req.send().map_err(|e| e.to_string())?;
+    if resp.status().is_redirection() {
+        return Err("重定向过多".into());
+    }
+    if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
+        || resp.status() == reqwest::StatusCode::OK
+    {
+        // 记录总量
+        let total = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        if existing == 0 {
+            if let Some(t) = total {
+                set_total(state, id, existing + t);
             }
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&tmp)
-                .map_err(|e| e.to_string())?;
-            let mut buf = [0u8; 256 * 1024];
-            let mut bytes = std::io::BufReader::new(resp);
-            loop {
-                if is_aborted(state, id) {
-                    finish(state, id, &out, &tmp, true);
-                    return Ok(());
-                }
-                let n = std::io::Read::read(&mut bytes, &mut buf).map_err(|e| e.to_string())?;
-                if n == 0 {
-                    break;
-                }
-                file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-                existing += n as u64;
-                set_done(state, id, existing);
-            }
-            file.flush().map_err(|e| e.to_string())?;
-            break;
-        } else {
-            return Err(format!("HTTP {}", resp.status().as_u16()));
         }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&tmp)
+            .map_err(|e| e.to_string())?;
+        let mut buf = [0u8; 256 * 1024];
+        let mut bytes = std::io::BufReader::new(resp);
+        loop {
+            if is_aborted(state, id) {
+                finish(state, id, &out, &tmp, true);
+                return Ok(());
+            }
+            let n = std::io::Read::read(&mut bytes, &mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+            existing += n as u64;
+            set_done(state, id, existing);
+        }
+        file.flush().map_err(|e| e.to_string())?;
+    } else {
+        return Err(format!("HTTP {}", resp.status().as_u16()));
     }
 
-    // 完成
-    let _ = std::fs::rename(&tmp, &out);
+    // 完成：改名（跨盘/目标已存在可能会失败，兜底为流式复制，避免"显示完成、实际还在 .part"）
+    if std::fs::rename(&tmp, &out).is_err() {
+        let mut sf = std::fs::File::open(&tmp).map_err(|e| e.to_string())?;
+        let mut df = std::fs::File::create(&out).map_err(|e| e.to_string())?;
+        std::io::copy(&mut sf, &mut df).map_err(|e| e.to_string())?;
+    }
     finish(state, id, &out, &tmp, false);
     Ok(())
 }
@@ -119,6 +122,7 @@ fn finish(state: &AppState, id: u64, out: &str, tmp: &str, aborted: bool) {
 }
 
 fn sanitize(name: &str) -> String {
+    // 防长标题撑爆 Windows MAX_PATH(260)：stem 截断到 120 字符
     let s: String = name
         .chars()
         .map(|c| match c {
@@ -126,6 +130,7 @@ fn sanitize(name: &str) -> String {
             c if (c as u32) < 32 => '_',
             c => c,
         })
+        .take(120)
         .collect();
     let s = s.trim();
     if s.is_empty() {
@@ -135,7 +140,7 @@ fn sanitize(name: &str) -> String {
     }
 }
 
-fn guess_ext(url: &str, _base: &str) -> String {
+fn guess_ext(url: &str) -> String {
     let lower = url.to_lowercase();
     for (pat, ext) in [
         (".mp4", "mp4"),

@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "com.mediadown.app",
   "build": {
-    "beforeDevCommand": "",
-    "beforeBuildCommand": "",
+    "beforeDevCommand": "npm run build:hook",
+    "beforeBuildCommand": "npm run build:hook",
     "frontendDist": "ui"
   },
   "app": {
