@@ -1,0 +1,23 @@
+# --- Rust / Cargo build artifacts ---
+/target
+**/target
+
+# --- Node / npm ---
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# --- Tauri / bundled binaries (user-provided tools & output) ---
+*.exe
+*.dll
+*.pdb
+downloads/
+tools/
+
+# --- OS / editor ---
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

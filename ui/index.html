@@ -1,0 +1,979 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MediaDown 控制台</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --bg-soft: #13161c;
+    --panel: #171a21;
+    --card: #1d212b;
+    --card-hover: #232834;
+    --border: #2a2f3b;
+    --text: #e8eaed;
+    --text-dim: #9aa3b2;
+    --text-faint: #6b7280;
+    --accent: #4ea1ff;
+    --accent-dark: #2f7fe0;
+    --green: #34c77b;
+    --orange: #f5a623;
+    --red: #e5484d;
+    --purple: #a78bfa;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.5 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    user-select: none;
+  }
+  input, button, select { font: inherit; }
+  input { user-select: text; }
+
+  /* ---------- header / 地址栏 ---------- */
+  header {
+    padding: 10px 12px 8px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    width: 360px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .logo {
+    width: 22px; height: 22px;
+    background: linear-gradient(135deg, var(--accent), #7c5cff);
+    border-radius: 6px;
+    display: grid; place-items: center;
+    font-size: 12px; font-weight: 700; color: #fff;
+  }
+  .brand h1 { font-size: 14px; font-weight: 700; letter-spacing: .3px; }
+  .brand .ver { color: var(--text-faint); font-size: 11px; margin-left: auto; }
+  .addr-row { display: flex; gap: 6px; }
+  .addr-row input {
+    flex: 1;
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 6px 10px;
+    outline: none;
+  }
+  .addr-row input:focus { border-color: var(--accent); }
+  .addr-row input::placeholder { color: var(--text-faint); }
+  button {
+    background: var(--card);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 12px;
+    cursor: pointer;
+    transition: background .15s, border-color .15s;
+    white-space: nowrap;
+  }
+  button:hover { background: var(--card-hover); border-color: #3a4150; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #0b1020; font-weight: 600; }
+  button.primary:hover { background: #6cb2ff; }
+  button.mini { padding: 2px 8px; font-size: 11px; border-radius: 5px; }
+  button.green { color: var(--green); border-color: rgba(52,199,123,.4); }
+  button.green:hover { background: rgba(52,199,123,.12); }
+  button.orange { color: var(--orange); border-color: rgba(245,166,35,.4); }
+  button.orange:hover { background: rgba(245,166,35,.12); }
+  button.danger { color: var(--red); border-color: rgba(229,72,77,.4); }
+  button.danger:hover { background: rgba(229,72,77,.12); }
+
+  /* ---------- main ---------- */
+  main {
+    flex: 1;
+    overflow-y: auto;
+    padding: 10px 12px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    width: 360px;
+  }
+  main::-webkit-scrollbar { width: 8px; }
+  main::-webkit-scrollbar-thumb { background: #2c323f; border-radius: 4px; }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+  /* 播放速度独立卡片：高亮以确保可见（此前藏在“设置”里被忽略） */
+  .speed-card { border-color: rgba(78,161,255,.5); }
+  .speed-card .rate-btn { background: var(--bg-soft); }
+  .card-title {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: .6px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+  .card-title .count { margin-left: auto; color: var(--text-faint); font-weight: 500; }
+
+  /* 设置项 */
+  .setting-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 0;
+  }
+  .setting-row .lbl { color: var(--text-dim); }
+  .setting-row .val { margin-left: auto; color: var(--text); font-weight: 600; }
+  .switch {
+    position: relative; width: 34px; height: 19px;
+    background: #2c323f; border-radius: 10px;
+    cursor: pointer; transition: background .2s; flex-shrink: 0;
+  }
+  .switch::after {
+    content: ""; position: absolute; top: 2px; left: 2px;
+    width: 15px; height: 15px; border-radius: 50%;
+    background: #8892a6; transition: transform .2s, background .2s;
+  }
+  .switch.on { background: var(--accent); }
+  .switch.on::after { transform: translateX(15px); background: #fff; }
+  input[type="range"] {
+    flex: 1; accent-color: var(--accent); height: 18px;
+  }
+  .rate-btns { display: flex; gap: 6px; margin-left: auto; }
+  .rate-btn {
+    min-width: 34px; padding: 4px 8px; border: 1px solid var(--border);
+    background: var(--bg-soft); color: var(--text); border-radius: 6px;
+    font-size: 12px; font-weight: 600; cursor: pointer; transition: all .12s;
+  }
+  .rate-btn:hover { border-color: var(--accent); }
+  .rate-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  /* 轨道列表 */
+  .item {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    border-radius: 7px;
+    padding: 7px 9px;
+    margin-bottom: 7px;
+  }
+  .item:last-child { margin-bottom: 0; }
+  .item-top { display: flex; align-items: center; gap: 6px; }
+  .badge {
+    font-size: 10px; font-weight: 700;
+    padding: 1px 6px; border-radius: 4px;
+    letter-spacing: .4px; flex-shrink: 0;
+  }
+  .badge.video { background: rgba(78,161,255,.18); color: var(--accent); }
+  .badge.audio { background: rgba(167,139,250,.18); color: var(--purple); }
+  .badge.text { background: rgba(245,166,35,.18); color: var(--orange); }
+  .badge.direct { background: rgba(52,199,123,.18); color: var(--green); }
+  .id { color: var(--text-faint); font-size: 11px; }
+  .ext { color: var(--accent); font-size: 11px; font-weight: 700; margin-left: 2px; flex-shrink: 0; }
+  .track-id { color: var(--text-faint); font-size: 11px; margin-left: 4px; }
+  .state {
+    font-size: 11px; margin-left: auto; font-weight: 600; flex-shrink: 0;
+  }
+  .state.dl { color: var(--green); }
+  .state.fin { color: var(--orange); }
+  .state.done { color: var(--text-dim); }
+  .state.err { color: var(--red); }
+  .meta { color: var(--text-dim); font-size: 11px; margin-top: 3px; }
+  .meta .mime { color: var(--text-faint); }
+  .ops { display: flex; gap: 5px; margin-top: 6px; flex-wrap: wrap; }
+  .name-edit { display: flex; gap: 5px; margin-top: 6px; }
+  .name-edit input {
+    flex: 1; background: var(--card); border: 1px solid var(--border);
+    color: var(--text); border-radius: 5px; padding: 3px 8px; font-size: 12px; outline: none;
+  }
+  .name-edit input:focus { border-color: var(--accent); }
+  .proj-name:focus { border-color: var(--accent); }
+  .url { color: var(--text-faint); font-size: 11px; word-break: break-all; margin-top: 3px; }
+  .fname {
+    width: 100%; margin-top: 6px; box-sizing: border-box;
+    background: var(--card); border: 1px solid var(--border);
+    color: var(--text); border-radius: 5px; padding: 5px 8px; font-size: 12px; outline: none;
+  }
+  .fname:focus { border-color: var(--accent); }
+  /* 项目更名弹窗 */
+  #proj-mask { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: center; justify-content: center; z-index: 60; }
+  #proj-mask.show { display: flex; }
+  #proj-box { width: 340px; max-height: 82vh; overflow: auto; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; box-shadow: 0 10px 40px rgba(0,0,0,.4); }
+  #proj-box .card-title { margin-bottom: 10px; }
+  .proj-item { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
+  .proj-item .pl { font-size: 11px; color: var(--text-dim); width: 86px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: none; }
+  .proj-item input { flex: 1; min-width: 0; background: var(--card); border: 1px solid var(--border); color: var(--text); border-radius: 5px; padding: 5px 8px; font-size: 12px; outline: none; }
+  .proj-item input:focus { border-color: var(--accent); }
+  #proj-box .row { margin-top: 14px; display: flex; justify-content: flex-end; }
+  /* 内联项目更名 */
+  .proj-inline-item { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
+  .proj-inline-item .pl { font-size: 11px; color: var(--text-dim); width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: none; }
+  .proj-inline-item input { flex: 1; min-width: 0; background: var(--bg-soft); border: 1px solid var(--border); color: var(--text); border-radius: 5px; padding: 4px 8px; font-size: 12px; outline: none; }
+  .proj-inline-item input:focus { border-color: var(--accent); }
+  .proj-inline-item button { flex: none; }
+  /* 保存目录：完整路径可换行显示，点击即弹出选择框 */
+  .save-path {
+    margin-top: 4px; width: 100%; box-sizing: border-box;
+    padding: 6px 8px; background: var(--bg-soft);
+    border: 1px dashed var(--border); border-radius: 6px;
+    color: var(--text-dim); font-size: 12px; word-break: break-all;
+    cursor: pointer; transition: border-color .15s, color .15s;
+  }
+  .save-path:hover { border-color: var(--accent); color: var(--text); }
+  .save-path.empty { color: var(--text-faint); font-style: italic; }
+
+  /* 进度条 */
+  .prog { height: 5px; background: #2c323f; border-radius: 3px; margin-top: 6px; overflow: hidden; }
+  .prog > div { height: 100%; background: var(--accent); border-radius: 3px; transition: width .3s; }
+
+  .empty { color: var(--text-faint); font-size: 12px; text-align: center; padding: 10px 0; }
+
+  /* ---------- footer ---------- */
+  footer {
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    padding: 6px 12px;
+    font-size: 11px;
+    color: var(--text-faint);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+    width: 360px;
+  }
+  footer .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
+  footer .save { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  footer .fbtn { padding: 2px 7px; font-size: 11px; }
+  footer .fbtn.danger { color: var(--red); }
+
+  /* 混流状态 toast（浮于左侧控制台之上，不被右侧浏览器遮挡） */
+  #toast {
+    position: fixed; left: 10px; bottom: 46px; max-width: 340px;
+    background: var(--card); border: 1px solid var(--border); color: var(--text);
+    padding: 8px 12px; border-radius: 8px; font-size: 12px; line-height: 1.4;
+    box-shadow: 0 6px 20px rgba(0,0,0,.45); opacity: 0; transform: translateY(8px);
+    transition: opacity .2s, transform .2s; pointer-events: none; z-index: 9999;
+  }
+  #toast.show { opacity: 1; transform: translateY(0); }
+  #toast.start { border-color: rgba(78,161,255,.5); }
+  #toast.done { border-color: rgba(52,199,123,.5); }
+  #toast.error { border-color: rgba(229,72,77,.6); }
+  #toast.skip { border-color: var(--border); }
+
+  /* 自定义确认框（替代 window.confirm，避免 Tauri webview 中同步模态对话框卡死渲染线程） */
+  #confirm-mask {
+    position: fixed; inset: 0; background: rgba(0,0,0,.5);
+    display: none; align-items: center; justify-content: center; z-index: 10000;
+  }
+  #confirm-mask.show { display: flex; }
+  #confirm-box {
+    width: 280px; box-sizing: border-box;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px; box-shadow: 0 10px 40px rgba(0,0,0,.5);
+  }
+  #confirm-box .msg { font-size: 13px; line-height: 1.5; margin-bottom: 14px; color: var(--text); }
+  #confirm-box .row { display: flex; gap: 8px; justify-content: flex-end; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <div class="logo">⬇</div>
+    <h1>MediaDown</h1>
+    <span class="ver">v0.1.0</span>
+  </div>
+  <div class="addr-row">
+    <input id="addr" type="text" placeholder="输入网址，回车打开（如 example.com/video）" spellcheck="false">
+    <button id="go" class="primary">打开</button>
+  </div>
+</header>
+
+<main>
+  <!-- 设置 -->
+  <div class="card">
+    <div class="card-title">⚙ 设置</div>
+    <div class="setting-row">
+      <span class="lbl">捕获插件</span>
+      <span class="switch" id="sw-enabled" title="注入并捕获媒体流"></span>
+    </div>
+    <div class="setting-row">
+      <span class="lbl">自动下载</span>
+      <span class="switch" id="sw-auto" title="捕获到轨道后自动开始下载"></span>
+    </div>
+    <div class="setting-row">
+      <span class="lbl">解除复制限制</span>
+      <span class="switch" id="sw-copy" title="强制可选文本 / 放行右键·复制·选择，选中自动复制"></span>
+    </div>
+    <div class="setting-row">
+      <span class="lbl">下载后混流</span>
+      <span class="switch" id="sw-mux" title="下载后用 tools/ffmpeg.exe（优先）或 tools/mkvmerge.exe 将视频轨+音频轨合并为单个 mkv"></span>
+    </div>
+    <div class="setting-row">
+      <span class="lbl" title="分片先缓冲再重构，修正 tfdt 断点/乱序/质量切换导致的音视频漂移">🎯 高精度同步</span>
+      <span class="switch" id="sw-hp" title="开启后：mp4 轨道分片先入内存缓冲，收尾时按 tfdt 排序/去重/断点平滑，重建为标准 MP4，修正音画漂移。默认开启。"></span>
+    </div>
+    <div class="setting-row">
+      <span class="lbl" title="轨道已结束但长时间无活动后自动收尾（秒）">⏱ 空闲超时</span>
+      <input type="number" id="idle-timeout-input" min="10" max="3600" step="10" value="60"
+             style="width:70px;background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:3px 8px;font-size:12px;">
+      <span class="val" id="idle-timeout-val" style="font-size:11px;color:var(--text-dim)">60 秒</span>
+    </div>
+    <!-- 混流工具缺失/出错的持久提示（轮询刷新，非一次性 toast） -->
+    <div class="meta" id="mux-hint" style="margin-top:4px;color:var(--red);display:none;"></div>
+    <div class="setting-row">
+      <span class="lbl">嗅探状态</span>
+      <span class="val" id="diag-text" style="font-weight:500;color:var(--text-dim)">检测中…</span>
+    </div>
+    <div class="setting-row">
+      <span class="lbl">保存目录</span>
+      <button class="mini primary" id="set-pick">修改目录</button>
+      <button class="mini" id="set-open">打开</button>
+    </div>
+    <div class="save-path" id="set-save-dir" title="">未设置</div>
+  </div>
+
+  <!-- 项目更名：常驻入口，不依赖下载状态，列出所有已注册项目 -->
+  <div class="card">
+    <div class="card-title">📁 项目更名</div>
+    <div id="proj-list-inline" style="margin-top:8px"><div class="empty">尚未捕获到媒体轨道，暂无可更名项目</div></div>
+    <div class="meta" style="margin-top:6px">捕获到媒体轨道后，可在此按项目统一设置输出文件名</div>
+  </div>
+
+  <!-- 播放速度（独立高亮卡片，置于顶部确保可见） -->
+  <div class="card speed-card">
+    <div class="card-title">⏩ 播放速度（作用于右侧视频）</div>
+    <div style="display:flex;align-items:center;gap:10px;margin-top:4px;">
+      <input type="range" id="rate-slider" min="10" max="1600" value="100" step="10"
+             style="flex:1;height:18px;accent-color:var(--accent);cursor:pointer;">
+      <span id="rate-val" style="min-width:54px;text-align:right;font-variant-numeric:tabular-nums;font-size:13px;font-weight:600;color:var(--text)">1.0x</span>
+      <button type="button" class="rate-btn" id="rate-reset" title="恢复默认 1x 速度">↺ 1x</button>
+    </div>
+    <div class="meta" style="margin-top:4px">拖动实时无级变速（0.1x–16x），视频在毫秒级生效</div>
+  </div>
+
+  <!-- MSE 轨道 -->
+  <div class="card">
+    <div class="card-title">🎬 MSE 轨道 <span class="count" id="track-count"></span></div>
+    <div id="tracks"><div class="empty">尚未捕获到媒体轨道</div></div>
+  </div>
+
+  <!-- 直链下载任务（置于“直链媒体”上方，符合用户预期） -->
+  <div class="card">
+    <div class="card-title">📥 下载任务 <span class="count" id="direct-count"></span></div>
+    <div id="directs"><div class="empty">暂无下载任务</div></div>
+  </div>
+
+  <!-- 直链媒体 -->
+  <div class="card">
+    <div class="card-title">🔗 直链媒体 <span class="count" id="report-count"></span></div>
+    <div id="reports"><div class="empty">未发现直链媒体</div></div>
+  </div>
+</main>
+
+<footer>
+  <span class="dot" id="status-dot"></span>
+  <span id="status-text">服务器启动中…</span>
+  <button class="fbtn" id="pick-dir">选择目录</button>
+  <button class="fbtn" id="open-dir">打开目录</button>
+  <button class="fbtn danger" id="clear-all">清空</button>
+  <span class="save" id="save-dir" title=""></span>
+</footer>
+
+<div id="toast"></div>
+
+<!-- 自定义确认框（纯 DOM，非阻塞，替代 window.confirm） -->
+<div id="confirm-mask">
+  <div id="confirm-box">
+    <div class="msg" id="confirm-msg">确定清空当前会话的所有轨道和下载任务？</div>
+    <div class="row">
+      <button class="mini" id="confirm-cancel">取消</button>
+      <button class="mini danger" id="confirm-ok">清空</button>
+    </div>
+  </div>
+</div>
+
+
+<!-- 项目更名弹窗（常驻入口，列出所有已注册项目） -->
+<div id="proj-mask">
+  <div id="proj-box">
+    <div class="card-title">📁 项目更名（按项目统一管理文件名）</div>
+    <div id="proj-list"></div>
+    <div class="row"><button class="mini" data-act="close-proj">关闭</button></div>
+  </div>
+</div>
+<script>
+(function () {
+  "use strict";
+  var invoke = window.__TAURI__.core.invoke;
+  var allTracks = [];
+
+  var $ = function (id) { return document.getElementById(id); };
+  function escapeHtml(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function fallbackCopy(text) {
+    try {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.cssText = "position:fixed;left:-9999px;top:-9999px;opacity:0;";
+      (document.body || document.documentElement).appendChild(ta);
+      ta.focus();
+      ta.select();
+      document.execCommand("copy");
+      if (ta.parentNode) ta.parentNode.removeChild(ta);
+    } catch (e) {}
+  }
+  var addrEl = $("addr"), goEl = $("go");
+  var swEnabled = $("sw-enabled"), swAuto = $("sw-auto");
+  var swCopy = $("sw-copy");
+  var swMux = $("sw-mux");
+  var rateSlider = $("rate-slider");
+  var rateValEl = $("rate-val");
+  var rateReset = $("rate-reset");
+  // 倍速 = 滑块值/100（min=10 → 0.1x，max=1600 → 16x，step=10 → 0.1x 精度）
+  function applyRateUI(r) {
+    if (rateSlider) rateSlider.value = Math.round(r * 100);
+    if (rateValEl) rateValEl.textContent = (Math.round(r * 10) / 10).toFixed(1) + "x";
+  }
+  function setRate(r) {
+    // 钳制到 [0.1, 16]，避免异常值导致视频停滞
+    r = Math.min(16, Math.max(0.1, r));
+    invoke("set_rate", { rate: r }).catch(console.error);
+    applyRateUI(r);
+  }
+  if (rateSlider) {
+    rateSlider.addEventListener("input", function () {
+      setRate(parseInt(rateSlider.value, 10) / 100);
+    });
+  }
+  if (rateReset) {
+    rateReset.addEventListener("click", function () { setRate(1); });
+  }
+
+  // ---------- 地址导航 ----------
+  function nav() {
+    var u = addrEl.value.trim();
+    if (!u) return;
+    invoke("navigate_to", { url: u }).catch(function (e) { alert("导航失败: " + e); });
+  }
+  goEl.addEventListener("click", nav);
+  addrEl.addEventListener("keydown", function (e) { if (e.key === "Enter") nav(); });
+
+  // ---------- 设置 ----------
+  swEnabled.addEventListener("click", function () {
+    var on = !swEnabled.classList.contains("on");
+    invoke("set_enabled", { enabled: on }).catch(console.error);
+    swEnabled.classList.toggle("on", on);
+  });
+  swAuto.addEventListener("click", function () {
+    var on = !swAuto.classList.contains("on");
+    invoke("set_auto", { auto: on }).catch(console.error);
+    swAuto.classList.toggle("on", on);
+  });
+  swCopy.addEventListener("click", function () {
+    var on = !swCopy.classList.contains("on");
+    invoke("set_copy_unlock", { enabled: on }).catch(console.error);
+    swCopy.classList.toggle("on", on);
+  });
+  swMux.addEventListener("click", function () {
+    var on = !swMux.classList.contains("on");
+    invoke("set_mux", { mux: on }).catch(console.error);
+    swMux.classList.toggle("on", on);
+  });
+  var swHp = $("sw-hp");
+  var idleInput = $("idle-timeout-input");
+  var idleVal = $("idle-timeout-val");
+  if (swHp) {
+    swHp.addEventListener("click", function () {
+      var on = !swHp.classList.contains("on");
+      invoke("set_high_precision", { enabled: on }).catch(console.error);
+      swHp.classList.toggle("on", on);
+    });
+  }
+  if (idleInput) {
+    idleInput.addEventListener("change", function () {
+      var v = parseInt(idleInput.value, 10);
+      if (isNaN(v) || v < 10) v = 10;
+      if (v > 3600) v = 3600;
+      idleInput.value = v;
+      if (idleVal) idleVal.textContent = v + " 秒";
+      invoke("set_idle_timeout", { secs: v }).catch(console.error);
+    });
+  }
+  // 统一更新“设置卡片”与“页脚”两处保存目录显示
+  function setSaveDir(dir) {
+    if (!dir) return;
+    var sp = $("set-save-dir");
+    sp.textContent = dir;
+    sp.title = dir;
+    sp.classList.remove("empty");
+    var f = $("save-dir");
+    f.textContent = "📁 " + dir;
+    f.title = dir;
+  }
+  // 点击路径本身也可弹出目录选择框（修改路径）
+  $("set-save-dir").addEventListener("click", function () {
+    invoke("pick_save_dir").then(setSaveDir).catch(console.error);
+  });
+  $("pick-dir").addEventListener("click", function () {
+    invoke("pick_save_dir").then(setSaveDir).catch(console.error);
+  });
+  $("open-dir").addEventListener("click", function () {
+    invoke("open_save_dir").catch(console.error);
+  });
+  $("set-pick").addEventListener("click", function () {
+    invoke("pick_save_dir").then(setSaveDir).catch(console.error);
+  });
+  $("set-open").addEventListener("click", function () {
+    invoke("open_save_dir").catch(console.error);
+  });
+  // 自定义确认框（替代 window.confirm，避免 Tauri webview 阻塞卡死）
+  var confirmMask = $("confirm-mask"), confirmOk = $("confirm-ok"), confirmCancel = $("confirm-cancel");
+  var confirmAction = null;
+  function showConfirm(msg, onOk) {
+    $("confirm-msg").textContent = msg;
+    confirmAction = onOk;
+    confirmMask.classList.add("show");
+  }
+  confirmCancel.addEventListener("click", function () {
+    confirmMask.classList.remove("show");
+    confirmAction = null;
+  });
+  confirmOk.addEventListener("click", function () {
+    var fn = confirmAction;
+    confirmAction = null;
+    confirmMask.classList.remove("show");
+    if (fn) fn();
+  });
+
+  $("clear-all").addEventListener("click", function () {
+    showConfirm("确定清空当前会话的所有轨道和下载任务？", function () {
+      invoke("clear_all").catch(console.error);
+    });
+  });
+
+  // ---------- 格式化 ----------
+  function fmtBytes(b) {
+    if (!b) return "0 B";
+    var u = ["B", "KB", "MB", "GB", "TB"];
+    var i = 0;
+    var v = b;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + " " + u[i];
+  }
+  function shortUrl(u, n) {
+    n = n || 46;
+    return u.length > n ? u.slice(0, n - 1) + "…" : u;
+  }
+  function kindLabel(k) {
+    return { video: "视频", audio: "音频", text: "字幕", hls: "HLS", other: "媒体" }[k] || k;
+  }
+  function stateLabel(t) {
+    if (t.finalized) return "已收尾";
+    if (t.finalizing) return "收尾中";
+    if (t.downloading) return "下载中";
+    if (t.ended) return "已结束";
+    if (t.started) return "已捕获";
+    return "等待";
+  }
+  function stateClass(t) {
+    if (t.downloading || t.finalizing) return "dl";
+    if (t.ended && !t.finalized) return "fin";
+    if (t.finalized) return "done";
+    return "dl";
+  }
+
+  // ---------- 渲染 ----------
+  function renderTracks(ts) {
+    var box = $("tracks");
+    $("track-count").textContent = ts.length ? ts.length + " 条" : "";
+    if (!ts.length) { box.innerHTML = '<div class="empty">尚未捕获到媒体轨道</div>'; return; }
+    var html = "";
+    for (var i = 0; i < ts.length; i++) {
+      var t = ts[i];
+      var stCls = stateClass(t), stLbl = stateLabel(t);
+      html += '<div class="item">'
+        + '<div class="item-top">'
+        + '<span class="badge ' + t.kind + '">' + kindLabel(t.kind) + '</span>'
+        + '<span class="id">#' + t.id + '</span>'
+        + '<span class="state ' + stCls + '">' + stLbl + '</span>'
+        + '</div>'
+        + (t.title ? '<div class="url" style="opacity:.8">📄 ' + escapeHtml(t.title) + '</div>' : "")
+        + '<div class="meta">' + fmtBytes(t.bytes) + ' · ' + t.segments + ' 分片 · ' + (t.ext || "")
+        + ' <span class="mime">' + (t.mime ? shortUrl(t.mime, 40) : "") + '</span></div>'
+        + (t.outPath ? '<div class="url">✓ ' + shortUrl(t.outPath, 60) + '</div>' : "")
+        + (t.name && t.name !== t.title ? '<div class="url" style="opacity:.85">📝 文件名：' + escapeHtml(t.name) + '</div>' : "")
+        + '<div class="ops">'
+        + (t.downloading
+            ? '<button class="mini danger" data-act="stop" data-id="' + t.id + '">停止</button>'
+            : (!t.finalized && t.started && !t.ended
+                ? '<button class="mini green" data-act="start" data-id="' + t.id + '">开始下载</button>'
+                : ""))
+        + (t.ended && !t.finalized
+            ? '<button class="mini orange" data-act="fin" data-id="' + t.id + '">收尾为 MP4</button>'
+            : "")
+        + '<button class="mini" data-act="rename" data-id="' + t.id + '">重命名</button>'
+        + '</div>'
+        + '<div class="name-edit" id="ne-' + t.id + '" style="display:none">'
+        + '<input id="nei-' + t.id + '" value="' + escapeAttr(t.name || t.title || "") + '" placeholder="自定义文件名（仅本文件）">'
+        + '<button class="mini primary" data-act="namesave" data-id="' + t.id + '">保存</button>'
+        + '</div>'
+        + '</div>';
+    }
+    box.innerHTML = html;
+    // 重建后恢复处于“重命名”展开的轨道及输入内容（避免 600ms 刷新清空）
+    Object.keys(renameOpen).forEach(function (rid) {
+      if (!renameOpen[rid]) return;
+      var be = $("ne-" + rid), ie = $("nei-" + rid);
+      if (be && ie) {
+        be.style.display = "flex";
+        if (renameVals[rid] != null) ie.value = renameVals[rid];
+      }
+    });
+  }
+
+  function renderReports(rs) {
+    var box = $("reports");
+    $("report-count").textContent = rs.length ? rs.length + " 条" : "";
+    if (!rs.length) { box.innerHTML = '<div class="empty">未发现直链媒体</div>'; return; }
+    var html = "";
+    for (var i = 0; i < rs.length; i++) {
+      var r = rs[i];
+      var title = r.title || r.pageUrl || "";
+      var defName = (title || (r.type === "video" ? "video" : "audio")) + "-" + i;
+      var curName = reportNames[r.url] || defName;
+      html += '<div class="item">'
+        + '<div class="item-top">'
+        + '<span class="badge ' + (r.type === "video" ? "video" : "direct") + '">' + kindLabel(r.type) + '</span>'
+        + '<span class="id">' + (r.size ? fmtBytes(r.size) : "") + '</span>'
+        + '</div>'
+        + '<div class="url">' + shortUrl(r.url, 70) + '</div>'
+        + '<input class="fname" id="rni-' + i + '" data-url="' + escapeAttr(r.url) + '" value="' + escapeAttr(curName) + '" placeholder="文件名（不含扩展名）">'
+        + '<div class="ops">'
+        + '<button class="mini" data-act="copy-url" data-url="' + escapeAttr(r.url) + '">复制链接</button>'
+        + '<button class="mini green" style="margin-left:auto" data-act="dl-report" data-idx="' + i + '" data-url="' + escapeAttr(r.url) + '" data-type="' + r.type + '" data-title="' + escapeAttr(title) + '">下载</button>'
+        + '</div>'
+        + '</div>';
+    }
+    box.innerHTML = html;
+  }
+
+  // 统一下载管理器：直链下载 + MSE 轨道中正在下载 / 收尾 / 已完成的项
+  function renderDirects(ds, ts) {
+    var box = $("directs");
+    var trackEntries = [];
+    for (var i = 0; i < ts.length; i++) {
+      var t = ts[i];
+      if (t.downloading || t.finalizing || t.finalized) trackEntries.push(t);
+    }
+    var directs = ds || [];
+    $("direct-count").textContent = (trackEntries.length + directs.length) ? (trackEntries.length + directs.length) + " 项" : "";
+    if (!trackEntries.length && !directs.length) {
+      box.innerHTML = '<div class="empty">暂无下载任务（MSE 捕获或直链下载后，进度显示在此）</div>';
+      return;
+    }
+    var html = "";
+    // 下载管理面板只展示单个文件（视频/音频）；项目级更名在左侧栏顶部「📁 项目更名」独立入口处理
+    for (var i = 0; i < trackEntries.length; i++) {
+      var tr = trackEntries[i];
+      var trBytes = tr.bytes || 0;
+      var trLbl = tr.finalized ? "完成" : (tr.finalizing ? "收尾中" : "下载中");
+      var trCls = tr.finalized ? "done" : (tr.finalizing ? "fin" : "dl");
+      var trName = tr.title ? tr.title : (tr.kind + "_" + tr.id);
+      var trExt = tr.kind === "audio" ? ".m4a" : ".mp4";
+      html += '<div class="item">'
+        + '<div class="item-top">'
+        + '<span class="badge ' + tr.kind + '">' + kindLabel(tr.kind) + '</span>'
+        + '<span class="id" title="' + escapeAttr(trName + trExt) + '">' + shortUrl(trName, 18) + '</span>'
+        + '<span class="ext">' + trExt + '</span>'
+        + '<span class="state ' + trCls + '">' + trLbl + '</span>'
+        + '</div>'
+        + '<div class="meta">' + fmtBytes(trBytes) + ' · ' + tr.segments + ' 分片 · 轨 #' + tr.id + '</div>'
+        + (tr.finalized && tr.outPath ? '<div class="url">✓ ' + shortUrl(tr.outPath, 60) + '</div>' : "")
+        + (tr.downloading ? '<div class="ops"><button class="mini danger" data-act="stop" data-id="' + tr.id + '">停止</button></div>' : "")
+        + '</div>';
+    }
+    // 直链下载
+    for (var j = 0; j < directs.length; j++) {
+      var d = directs[j];
+      var pct = d.total ? Math.min(100, Math.round(d.done / d.total * 100)) : 0;
+      var stLbl = d.downloading ? "下载中" : (d.aborted ? "已中止" : (d.finished ? "完成" : "等待"));
+      var stCls = d.downloading ? "dl" : (d.aborted ? "err" : (d.finished ? "done" : "fin"));
+      html += '<div class="item">'
+        + '<div class="item-top">'
+        + '<span class="badge direct">直链</span>'
+        + '<span class="id">' + shortUrl(d.name, 18) + '</span>'
+        + '<span class="state ' + stCls + '">' + stLbl + '</span>'
+        + '</div>'
+        + '<div class="meta">' + fmtBytes(d.done) + (d.total ? " / " + fmtBytes(d.total) : "") + '</div>'
+        + (d.downloading ? '<div class="prog"><div style="width:' + pct + '%"></div></div>' : "")
+        + (d.error ? '<div class="url">✗ ' + shortUrl(d.error, 60) + '</div>' : "")
+        + (d.outPath ? '<div class="url">✓ ' + shortUrl(d.outPath, 60) + '</div>' : "")
+        + (d.downloading ? '<div class="ops"><button class="mini danger" data-act="stop-direct" data-id="' + d.id + '">停止</button></div>' : "")
+        + '</div>';
+    }
+    box.innerHTML = html;
+  }
+
+  // 项目更名弹窗：列出所有已注册项目（不依赖下载状态）
+  function openProjRename() {
+    var list = $("proj-list");
+    var seen = {}, projs = [];
+    for (var i = 0; i < allTracks.length; i++) {
+      var t = allTracks[i];
+      var pk = t.project || ("#" + t.id);
+      if (!seen[pk]) { seen[pk] = true; projs.push({ key: pk, name: t.name || t.title || "" }); }
+    }
+    if (!projs.length) {
+      list.innerHTML = '<div class="empty">尚未捕获到媒体轨道，暂无可更名项目</div>';
+    } else {
+      var html = "";
+      for (var j = 0; j < projs.length; j++) {
+        var pr = projs[j];
+        var cur = projRenameVals[pr.key] != null ? projRenameVals[pr.key] : pr.name;
+        var shortKey = pr.key.length > 12 ? pr.key.slice(0, 12) + "…" : pr.key;
+        html += '<div class="proj-item">'
+          + '<span class="pl" title="' + escapeAttr(pr.key) + '">' + escapeHtml(shortKey) + '</span>'
+          + '<input class="proj-in proj-name" data-project="' + escapeAttr(pr.key) + '" value="' + escapeAttr(cur) + '" placeholder="新项目名">' +
+          + '<button class="mini primary" data-act="proj-save" data-project="' + escapeAttr(pr.key) + '">保存</button>'
+          + '</div>';
+      }
+      list.innerHTML = html;
+    }
+    $("proj-mask").classList.add("show");
+  }
+  function closeProjRename() { $("proj-mask").classList.remove("show"); }
+  document.getElementById("proj-mask").addEventListener("click", function (e) {
+    if (e.target === this) closeProjRename();
+  });
+
+  // 内联项目更名：在设置区直接显示可编辑的项目名列表
+  function renderProjRenameInline() {
+    var container = $("proj-list-inline");
+    if (!container) return;
+    var seen = {}, projs = [];
+    for (var i = 0; i < allTracks.length; i++) {
+      var t = allTracks[i];
+      var pk = t.project || ("#" + t.id);
+      if (!seen[pk]) { seen[pk] = true; projs.push({ key: pk, name: t.name || t.title || "" }); }
+    }
+    if (!projs.length) {
+      container.innerHTML = '<div class="empty">尚未捕获到媒体轨道，暂无可更名项目</div>';
+      return;
+    }
+    var html = "";
+    for (var j = 0; j < projs.length; j++) {
+      var pr = projs[j];
+      var cur = projRenameVals[pr.key] != null ? projRenameVals[pr.key] : pr.name;
+      var shortKey = pr.key.length > 16 ? pr.key.slice(0, 16) + "…" : pr.key;
+      html += '<div class="proj-inline-item">'
+        + '<span class="pl" title="' + escapeAttr(pr.key) + '">' + escapeHtml(shortKey) + '</span>'
+        + '<input class="proj-name" data-project="' + escapeAttr(pr.key) + '" value="' + escapeAttr(cur) + '" placeholder="新项目名">'
+        + '<button class="mini primary" data-act="proj-save" data-project="' + escapeAttr(pr.key) + '">保存</button>'
+        + '</div>';
+    }
+    container.innerHTML = html;
+  }
+
+  function escapeAttr(s) {
+    return String(s).replace(/"/g, "&quot;").replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  }
+
+  // 直链卡片用户输入的文件名（key=url），避免状态刷新时清空
+  var reportNames = {};
+
+  // 正在重命名的轨道：renameOpen[id]=true 表示展开；renameVals[id] 保存输入中文本，
+  // 二者配合 600ms 刷新重建 DOM 时恢复展开态与已输入内容，避免被清空。
+  var renameOpen = {};
+  var renameVals = {};
+  // 项目级更名输入框内容（key=project），避免 600ms 刷新清空
+  var projRenameVals = {};
+  // 用户正在编辑项目名：暂停 renderProjRenameInline，避免重建抢焦点/清空已输入内容
+  // 保存后短暂 hold（500ms），给用户时间继续编辑其他项目
+  var projEditHoldUntil = 0;
+
+  // ---------- 事件委托 ----------
+  document.addEventListener("input", function (e) {
+    var inp = e.target.closest("input.fname");
+    if (inp) { reportNames[inp.dataset.url] = inp.value; return; }
+    var ne = e.target.closest("input[id^='nei-']");
+    if (ne) { renameVals[ne.id.slice(4)] = ne.value; return; }
+    var pe = e.target.closest("input.proj-name");
+    if (pe) { projRenameVals[pe.dataset.project] = pe.value; }
+  });
+
+  document.addEventListener("click", function (e) {
+    var btn = e.target.closest("button[data-act]");
+    if (!btn) return;
+    var act = btn.dataset.act, id = btn.dataset.id;
+    if (act === "start") invoke("download_track", { trackId: String(id), start: true }).catch(console.error);
+    else if (act === "stop") invoke("download_track", { trackId: String(id), start: false }).catch(console.error);
+    else if (act === "fin") invoke("finalize_track", { trackId: String(id) }).catch(console.error);
+    else if (act === "rename") {
+      var boxEl = $("ne-" + id);
+      if (!boxEl) return;
+      var willOpen = boxEl.style.display !== "flex";
+      renameOpen[id] = willOpen;
+      boxEl.style.display = willOpen ? "flex" : "none";
+      if (willOpen) {
+        var input = $("nei-" + id);
+        if (input) {
+          if (renameVals[id] != null) input.value = renameVals[id];
+          input.focus();
+          input.select();
+        }
+      }
+    }
+    else if (act === "namesave") {
+      var input2 = $("nei-" + id);
+      var val = input2 ? input2.value : "";
+      renameVals[id] = val;
+      // 逐文件更名：仅本视频/音频轨道（命令参数键为 trackId，见 main.rs set_name）
+      invoke("set_name", { trackId: id, name: val }).catch(console.error);
+      renameOpen[id] = false;
+      var boxEl2 = $("ne-" + id);
+      if (boxEl2) boxEl2.style.display = "none";
+    }
+    else if (act === "proj-save") {
+      // 从按钮所在行取 input 当前值（不依赖 input 事件缓存，防止时序问题）
+      var pitem = btn.closest(".proj-item, .proj-inline-item");
+      var pinp = pitem ? pitem.querySelector("input[class*='proj-name']") : null;
+      var pval2 = pinp ? pinp.value : "";
+      var pkey2 = btn.dataset.project || "";
+      projRenameVals[pkey2] = pval2;
+      invoke("set_project_name", { project: pkey2, name: pval2 }).catch(console.error);
+      // 保存后 hold 500ms，防止下一轮 refresh 重建 DOM 抢焦点
+      projEditHoldUntil = Date.now() + 500;
+      // 保存后自动失焦，避免后续事件干扰
+      if (pinp) pinp.blur();
+    }
+    else if (act === "open-proj") {
+      openProjRename();
+    }
+    else if (act === "close-proj") {
+      closeProjRename();
+    }
+    else if (act === "dl-report") {
+      var url = btn.dataset.url, type = btn.dataset.type, title = btn.dataset.title, idx = btn.dataset.idx;
+      var inp = $("rni-" + idx);
+      var name = (inp && inp.value.trim()) ? inp.value.trim() : (title || (type === "video" ? "video" : "audio"));
+      var newId = String(Date.now());
+      invoke("direct_download", { id: newId, url: url, name: name, start: true }).catch(console.error);
+    }
+    else if (act === "copy-url") {
+      var copyUrl = btn.dataset.url;
+      var copyBtn = btn;
+      var done = function () {
+        var old = copyBtn.textContent;
+        copyBtn.textContent = "已复制";
+        setTimeout(function () { copyBtn.textContent = old; }, 1200);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(copyUrl).then(done).catch(function () {
+          fallbackCopy(copyUrl); done();
+        });
+      } else {
+        fallbackCopy(copyUrl); done();
+      }
+    }
+    else if (act === "stop-direct") {
+      invoke("direct_download", { id: String(id), url: "", name: "", start: false }).catch(console.error);
+    }
+  });
+
+  // ---------- 混流状态 toast ----------
+  var toastEl = $("toast"), toastTimer = null;
+  function showToast(msg, kind) {
+    if (!msg) return;
+    toastEl.textContent = msg;
+    toastEl.className = "show " + (kind || "");
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () {
+      toastEl.className = toastEl.className.replace(/\bshow\b/, "").trim();
+    }, 3400);
+  }
+  if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen) {
+    window.__TAURI__.event.listen("md-mux", function (e) {
+      var p = (e && e.payload) || {};
+      showToast(p.msg || "", p.status || "");
+    }).catch(console.error);
+  }
+
+  // ---------- 轮询 ----------
+  var lastSettings = null;
+  function refresh() {
+    invoke("get_state").then(function (s) {
+      // 正在编辑文件名时跳过对应列表重建，避免刷新抢走焦点 / 清空输入
+      var ae = document.activeElement;
+      var editingTrack = ae && ae.id && ae.id.indexOf("nei-") === 0;
+      var editingReport = ae && ae.id && ae.id.indexOf("rni-") === 0;
+      var editingProj = ae && ae.classList && ae.classList.contains("proj-name");
+      if (!editingTrack) renderTracks(s.tracks || []);
+      if (!editingReport) renderReports(s.reports || []);
+      renderDirects(s.directs || [], s.tracks || []);
+      allTracks = s.tracks || [];
+      // 同步内联项目更名列表
+      if (Date.now() < projEditHoldUntil) { /* 保存后短暂 hold，跳过重建 */ }
+      else if (!editingProj) renderProjRenameInline();
+      // 设置同步（避免与服务端状态脱节）
+      var hpOn = !!s.highPrecision;
+      if (lastSettings !== s.enabled + "|" + s.auto + "|" + s.rate + "|" + s.copyUnlock + "|" + s.mux + "|" + hpOn + "|" + s.idleTimeout) {
+        swEnabled.classList.toggle("on", !!s.enabled);
+        swAuto.classList.toggle("on", !!s.auto);
+        swCopy.classList.toggle("on", !!s.copyUnlock);
+        swMux.classList.toggle("on", !!s.mux);
+        if (swHp) swHp.classList.toggle("on", hpOn);
+        var rv = Math.round(s.rate * 100) / 100;
+        applyRateUI(rv);
+        if (idleInput) {
+          idleInput.value = s.idleTimeout || 60;
+          if (idleVal) idleVal.textContent = (s.idleTimeout || 60) + " 秒";
+        }
+        lastSettings = s.enabled + "|" + s.auto + "|" + s.rate + "|" + s.copyUnlock + "|" + s.mux + "|" + hpOn + "|" + s.idleTimeout;
+      }
+      $("status-dot").style.background = s.port ? "var(--green)" : "var(--red)";
+      $("status-text").textContent = s.port ? ("服务器 :" + s.port) : "服务器未启动";
+      setSaveDir(s.saveDir);
+      // 混流工具缺失/出错提示
+      var muxHint = $("mux-hint");
+      if (muxHint) {
+        var muxHintOn = !!s.mux && s.muxHint;
+        muxHint.style.display = muxHintOn ? "block" : "none";
+        if (muxHintOn) muxHint.textContent = "⚠ " + s.muxHint;
+      }
+      // 嗅探状态诊断
+      var diag = s.hookDiag || {};
+      var diagEl = $("diag-text");
+      if (diag.installed) {
+        var unk = diag.unknownBytes || 0;
+        var where = diag.inFrame ? "iframe 内" : "主页面";
+        diagEl.textContent = "已注入·" + where + "·未知 " + fmtBytes(unk);
+        diagEl.style.color = unk > 0 ? "var(--orange)" : "var(--green)";
+      } else {
+        diagEl.textContent = "未注入";
+        diagEl.style.color = "var(--red)";
+      }
+    }).catch(function (e) {
+      $("status-text").textContent = "状态获取失败";
+      console.error(e);
+    });
+  }
+  setInterval(refresh, 600);
+  refresh();
+})();
+</script>
+</body>
+</html>

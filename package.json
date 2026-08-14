@@ -1,0 +1,19 @@
+{
+  "name": "media-down",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo 'No tests specified' && exit 0",
+    "build:hook": "esbuild hook-ts/index.ts --bundle --format=iife --target=es2017 --outfile=src/hook.js",
+    "check:hook": "tsc -p hook-ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "esbuild": "^0.28.1",
+    "typescript": "^7.0.2"
+  }
+}
