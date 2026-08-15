@@ -430,7 +430,7 @@
 
   // hook-ts/mse.ts
   var sbMap = /* @__PURE__ */ new WeakMap();
-  var msEntries = [];
+  var msEntriesMap = /* @__PURE__ */ new WeakMap();
   var msSeq = 0;
   var msSessionMap = /* @__PURE__ */ new WeakMap();
   function sessionOf(ms) {
@@ -475,7 +475,12 @@
         session: sessionOf(this)
       };
       sbMap.set(sb, entry);
-      msEntries.push(entry);
+      let arr = msEntriesMap.get(this);
+      if (!arr) {
+        arr = [];
+        msEntriesMap.set(this, arr);
+      }
+      arr.push(entry);
       wrapSB(sb, entry);
       return sb;
     };
@@ -483,19 +488,18 @@
     MS.prototype.endOfStream = function() {
       const r = nativeEOS.apply(this, arguments);
       if (rt.cfg) {
-        for (let k = 0; k < msEntries.length; k++) {
-          const entry = msEntries[k];
-          if (entry.ms === this && !entry.ended) {
-            entry.ended = true;
-            if (entry.trackId != null) {
-              post("/seg/" + rt.cfg.token + "/" + entry.trackId + "/end", new Uint8Array(0));
+        const arr = msEntriesMap.get(this);
+        if (arr) {
+          for (let k = 0; k < arr.length; k++) {
+            const entry = arr[k];
+            if (!entry.ended) {
+              entry.ended = true;
+              if (entry.trackId != null) {
+                post("/seg/" + rt.cfg.token + "/" + entry.trackId + "/end", new Uint8Array(0));
+              }
             }
           }
         }
-        const self = this;
-        msEntries = msEntries.filter(function(e) {
-          return e.ms !== self;
-        });
       }
       return r;
     };

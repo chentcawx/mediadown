@@ -33,14 +33,17 @@ const GAP_THRESHOLD_SEC: f64 = 0.5;
 struct Seg {
     /// tfdt.base_media_decode_time（绝对时间，单位 timescale）。无 tfdt 时为 None。
     tfdt_base: Option<u64>,
-    /// tfhd.track_id
-    track_id: u32,
     /// tfhd.default_sample_duration（来自 0x08 flag）
     default_dur: Option<u32>,
     /// 到达序号，用于相同 tfdt 时的稳定排序 tie-break
     seq: u64,
     /// 原始 moof box 完整字节（含 8 字节头），finalize 时原样输出
     moof_bytes: Vec<u8>,
+    /// 与该 moof 配对的样本数据（mdat box 完整字节）。
+    /// 合并发送（moof+mdat 同一段）时由 append 从同段拆分填入；
+    /// 分离发送（moof、mdat 各一段）时由后续 mdat 段挂到最近 moof。
+    /// 缺失会导致 finalize 重建的 MP4 无样本数据 -> 高精度模式混流失败。
+    mdat: Option<Vec<u8>>,
 }
 
 /// 单轨缓冲状态
@@ -54,10 +57,12 @@ pub struct TrackBuffer {
     segments: BTreeMap<(u64, u64), Seg>,
     /// 当前估计的 timescale（从 init 里 mdhd 读，缺省 1000）
     timescale: u32,
-    /// 累计已缓冲字节数，用于内存保护判断
-    cached_bytes: u64,
     /// 上一段估计结束时间戳（timescale 单位），用于缺 tfdt 时的连续化占位
     last_end_ts: u64,
+    /// 最近一次插入的 moof 的 segments key。跨 append 调用保持，用于把“分离发送”
+    /// （moof 一段、mdat 另一段）的 mdat 挂到正确的 moof；避免 mdat 因 last_key 局部变量
+    /// 在下次 append 调用时丢失而变成孤儿、最终被丢弃导致混流失败。
+    last_moof: Option<(u64, u64)>,
     /// 是否已触发降级
     fallback_active: bool,
     /// 降级后追加的目标文件路径
@@ -71,7 +76,35 @@ impl TrackBuffer {
     pub fn estimated_bytes(&self) -> u64 {
         let seg_bytes: u64 = self.segments.values().map(|s| s.moof_bytes.len() as u64).sum();
         let init_bytes = self.init.as_ref().map(|v| v.len() as u64).unwrap_or(0);
-        init_bytes + seg_bytes + self.cached_bytes
+        // 注意：cached_bytes 与 segments/init 内的字节是同一批数据（append 时两侧同步累加），
+        // 这里绝不能再加 cached_bytes，否则内存占用被重复计算为 2 倍 →
+        // 缓冲看起来“更占内存”，溢出降级会在真实阈值一半处误触发。
+        init_bytes + seg_bytes
+    }
+
+    /// 已缓冲的分片数量（用于落盘后更新 writer 计数）
+    pub fn seg_count(&self) -> u64 {
+        self.segments.len() as u64
+    }
+
+    /// 把缓冲的原始分片（init + 各 moof 原始字节，按 BTreeMap 顺序）写出到 writer。
+    /// 用于「关闭高精度」时把已缓冲的早期分片转为边下边存：写出的就是 fragmented MP4 字节流，
+    /// 与后续流式分片在 .tmp-part 中按到达顺序拼接，保证收尾文件完整、不丢尾。
+    pub fn flush_raw<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<u64> {
+        let mut written = 0u64;
+        if let Some(ref init) = self.init {
+            w.write_all(init)?;
+            written += init.len() as u64;
+        }
+        for seg in self.segments.values() {
+            w.write_all(&seg.moof_bytes)?;
+            written += seg.moof_bytes.len() as u64;
+            if let Some(ref md) = seg.mdat {
+                w.write_all(md)?;
+                written += md.len() as u64;
+            }
+        }
+        Ok(written)
     }
 
     /// 是否处于降级状态
@@ -82,6 +115,10 @@ impl TrackBuffer {
     /// 追加一段原始字节。bytes 可能是：
     ///   - init 片段（以 ftyp/moov 开头）
     ///   - moof 片段（以 moof 开头，含 traf+tfhd+trun+tfdt）
+    ///   - mdat 片段（以 mdat 开头，含样本数据）
+    /// 一条 MSE 分片可能把 moof+mdat 合并发送，也可能分两次各发 moof / mdat。
+    /// 两者都必须保留：仅存 moof 而丢弃 mdat 会导致 finalize 重建出的 MP4
+    /// 缺样本数据，高精度模式下混流失败（非高精度走 .tmp-part 原始字节故正常）。
     /// 返回 (init_consumed, seg_consumed, error_hint)。
     pub fn append(&mut self, bytes: &[u8]) -> (bool, bool, Option<String>) {
         if bytes.is_empty() {
@@ -93,7 +130,7 @@ impl TrackBuffer {
             }
             return (false, false, None);
         }
-        // 判断是 init 还是 moof
+        // 判断是 init 还是 moof/mdat
         if is_init_start(bytes) {
             let sig = box_util::sig_of(bytes);
             match &self.init_sig {
@@ -109,44 +146,90 @@ impl TrackBuffer {
                             self.timescale = ts;
                         }
                     }
-                    self.cached_bytes += bytes.len() as u64;
                     return (true, false, None);
                 }
             }
         }
-        match parse_moof_box(bytes) {
-            Some(mut seg) => {
-                if seg.tfdt_base.is_none() {
-                    seg.tfdt_base = Some(self.last_end_ts);
-                }
-                let tfdt_key = seg.tfdt_base.unwrap();
-                let ts = self.timescale.max(1);
-                let corrected_key = if self.last_end_ts > 0 {
-                    let gap_sec = (tfdt_key as f64 - self.last_end_ts as f64) / ts as f64;
-                    if gap_sec > GAP_THRESHOLD_SEC {
-                        self.last_end_ts
+        // 非 init：按顶层 box 拆分，捕获 moof（含 tfdt/traf）与 mdat（样本数据）。
+        let mut saw_moof = false;
+        let mut consumed_mdat = false;
+        let mut pending_mdat: Option<Vec<u8>> = None; // mdat 先于任何 moof 到达时的暂存
+        let mut pos = 0usize;
+        while pos + 8 <= bytes.len() {
+            let size32 = box_util::be32(&bytes[pos..pos + 4]) as usize;
+            let typ = &bytes[pos + 4..pos + 8];
+            let size = if size32 == 1 {
+                if pos + 16 > bytes.len() { break; }
+                box_util::be64(&bytes[pos + 8..pos + 16]) as usize
+            } else if size32 == 0 {
+                bytes.len() - pos
+            } else {
+                size32
+            };
+            if size < 8 || pos + size > bytes.len() {
+                break;
+            }
+            let box_slice = &bytes[pos..pos + size];
+            if typ == b"moof" {
+                if let Some(mut seg) = parse_moof_box(box_slice) {
+                    if seg.tfdt_base.is_none() {
+                        seg.tfdt_base = Some(self.last_end_ts);
+                    }
+                    let ts = self.timescale.max(1);
+                    let tfdt_key = seg.tfdt_base.unwrap();
+                    let corrected_key = if self.last_end_ts > 0 {
+                        let gap_sec = (tfdt_key as f64 - self.last_end_ts as f64) / ts as f64;
+                        if gap_sec > GAP_THRESHOLD_SEC {
+                            self.last_end_ts
+                        } else {
+                            tfdt_key
+                        }
                     } else {
                         tfdt_key
+                    };
+                    // 合并发送时 box_slice 已是纯 moof；parse_moof_box 内部 moof_bytes
+                    // 取整个入参，故此处确保只存纯 moof 字节（不含后续 mdat 尾随）。
+                    seg.moof_bytes = box_slice.to_vec();
+                    let key = (corrected_key, seg.seq);
+                    let replaced = self.segments.contains_key(&key);
+                    if !replaced {
+                        self.segments.insert(key, seg.clone());
+                    }
+                    // 若此前 mdat 先于 moof 到达，则挂到本段
+                    if let Some(md) = pending_mdat.take() {
+                        if let Some(s) = self.segments.get_mut(&key) {
+                            s.mdat = Some(md);
+                        }
+                    }
+                    // 持久化最近 moof key，使“分离发送”（moof 一段、mdat 另一段）的
+                    // 后续 mdat 能在下一次 append 调用时正确挂到本 moof。
+                    self.last_moof = Some(key);
+                    let sample_count = count_samples_in_moof(box_slice);
+                    let dur_per_sample = seg.default_dur.unwrap_or(1000);
+                    self.last_end_ts =
+                        corrected_key + (sample_count as u64) * (dur_per_sample as u64);
+                    saw_moof = true;
+                }
+            } else if typ == b"mdat" {
+                // 样本数据：挂到最近一个 moof（跨调用保持，覆盖合并/分离两种发送方式）
+                if let Some(key) = self.last_moof {
+                    if let Some(s) = self.segments.get_mut(&key) {
+                        s.mdat = Some(box_slice.to_vec());
+                        consumed_mdat = true;
                     }
                 } else {
-                    tfdt_key
-                };
-                let key = (corrected_key, seg.seq);
-                let replaced = self.segments.contains_key(&key);
-                if !replaced {
-                    self.segments.insert(key, seg.clone());
+                    pending_mdat = Some(box_slice.to_vec());
+                    consumed_mdat = true;
                 }
-                let sample_count = count_samples_in_moof(bytes);
-                let dur_per_sample = seg.default_dur.unwrap_or(1000);
-                self.last_end_ts = corrected_key + (sample_count as u64) * (dur_per_sample as u64);
-                self.cached_bytes += bytes.len() as u64;
-                if self.estimated_bytes() > MAX_BUFFER_BYTES {
-                    self.activate_fallback();
-                }
-                (false, true, None)
             }
-            None => (false, false, Some("无法解析分片（非 init、非 moof）".into())),
+            pos += size;
         }
+        if self.estimated_bytes() > MAX_BUFFER_BYTES {
+            self.activate_fallback();
+        }
+        // 返回值语义保持与历史一致：第一项为 init 是否被消费，第二项为分片是否被消费。
+        // moof/mdat 段均非 init，故第一项为 false。
+        (false, saw_moof || consumed_mdat, None)
     }
 
     /// 激活降级：创建临时文件，后续所有分片直写磁盘
@@ -171,6 +254,9 @@ impl TrackBuffer {
                 }
                 for seg in self.segments.values() {
                     let _ = f.write_all(&seg.moof_bytes);
+                    if let Some(ref md) = seg.mdat {
+                        let _ = f.write_all(md);
+                    }
                 }
                 self.fallback_path = Some(tmp.clone());
                 self.fallback_file = Some(f);
@@ -215,6 +301,9 @@ impl TrackBuffer {
             }
             for seg in self.segments.values() {
                 f.write_all(&seg.moof_bytes).map_err(|e| e.to_string())?;
+                if let Some(ref md) = seg.mdat {
+                    f.write_all(md).map_err(|e| e.to_string())?;
+                }
             }
         }
         // 复用现有 fmp4 重构器
@@ -268,7 +357,6 @@ fn parse_moof_box(bytes: &[u8]) -> Option<Seg> {
         return None;
     }
     let content = &bytes[8..];
-    let mut track_id: Option<u32> = None;
     let mut tfdt_base: Option<u64> = None;
     let mut default_dur: Option<u32> = None;
 
@@ -285,7 +373,8 @@ fn parse_moof_box(bytes: &[u8]) -> Option<Seg> {
                 if ttyp == b"tfhd" && tsize >= 8 {
                     let payload = &traf[tpos + 8..tpos + tsize];
                     if payload.len() >= 8 {
-                        track_id = Some(box_util::be32(&payload[4..8]));
+                        // tfhd.track_id 字段被解析但当前实现不依赖（缓存按 track 维度隔离），故仅消费该 box 不保留。
+                        let _ = box_util::be32(&payload[4..8]);
                     }
                     let flags = box_util::be32(payload);
                     if flags & 0x08 != 0 {
@@ -319,7 +408,6 @@ fn parse_moof_box(bytes: &[u8]) -> Option<Seg> {
         pos += size;
     }
 
-    let track_id = track_id.or(Some(1))?;
     let seq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -327,10 +415,10 @@ fn parse_moof_box(bytes: &[u8]) -> Option<Seg> {
 
     Some(Seg {
         tfdt_base,
-        track_id,
         default_dur,
         seq,
         moof_bytes: bytes.to_vec(),
+        mdat: None,
     })
 }
 
@@ -403,5 +491,68 @@ mod tests {
         assert!(init_added);
         assert!(!seg_added);
         assert!(err.is_none());
+    }
+
+    /// 回归测试：高精度模式分离发送 moof / mdat 两段时，样本数据不得被丢弃。
+    /// 此前 append 仅识别 moof、把独立 mdat 当“无法解析”丢弃，导致 finalize 重建的
+    /// MP4 缺样本数据，混流失败（非高精度走 .tmp-part 原始字节故正常）。
+    #[test]
+    fn appended_separate_mdat_is_retained() {
+        let mut tb = TrackBuffer::default();
+        let init = box_util::box_bytes(b"ftyp", b"isom\x00\x00\x00\x00isom");
+        tb.append(&init);
+
+        // 一个最小 moof（含 traf，使 parse_moof_box 接受；traf 内容任意，本测试只验证 mdat 捕获）
+        let moof = box_util::box_bytes(b"moof", &box_util::box_bytes(b"traf", &[0u8; 8]));
+        let (i1, s1, e1) = tb.append(&moof);
+        assert!(!i1);
+        assert!(s1);
+        assert!(e1.is_none());
+
+        // 分离发送的 mdat（独立 appendBuffer 段）
+        let mdat = box_util::box_bytes(b"mdat", &[0xABu8; 64]);
+        let (i2, s2, e2) = tb.append(&mdat);
+        assert!(!i2);
+        assert!(s2, "分离 mdat 应被计为已消费，而非报“无法解析”");
+        assert!(e2.is_none());
+
+        // 断言缓冲里确实持有 mdat 样本数据
+        let seg = tb.segments.values().next().expect("应有 moof 段");
+        assert!(
+            seg.moof_bytes.windows(4).any(|w| w == b"moof"),
+            "moof 未正确存储"
+        );
+        assert!(
+            seg.mdat
+                .as_ref()
+                .map_or(false, |m| m.windows(4).any(|w| w == b"mdat")),
+            "分离发送的 mdat 在高精度缓冲中被丢弃 -> 混流将失败"
+        );
+    }
+
+    /// 回归测试：合并发送 moof+mdat 同一段时，mdat 仍应被捕获（不被当作 moof 尾随垃圾丢弃）。
+    #[test]
+    fn appended_merged_moof_mdat_is_retained() {
+        let mut tb = TrackBuffer::default();
+        let init = box_util::box_bytes(b"ftyp", b"isom\x00\x00\x00\x00isom");
+        tb.append(&init);
+
+        let moof = box_util::box_bytes(b"moof", &box_util::box_bytes(b"traf", &[0u8; 8]));
+        let mdat = box_util::box_bytes(b"mdat", &[0xCDu8; 32]);
+        let merged: Vec<u8> = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&moof);
+            v.extend_from_slice(&mdat);
+            v
+        };
+        tb.append(&merged);
+
+        let seg = tb.segments.values().next().expect("应有 moof 段");
+        assert!(
+            seg.mdat
+                .as_ref()
+                .map_or(false, |m| m.windows(4).any(|w| w == b"mdat")),
+            "合并发送时 mdat 应被拆分捕获"
+        );
     }
 }

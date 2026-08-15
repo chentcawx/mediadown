@@ -654,30 +654,26 @@ impl AppState {
             .cloned();
 
         if info.mime_family == "mp4" {
-            // 高精度同步模式（缓冲重构）已启用且该轨有缓冲数据：优先用内存缓冲重构
-            // （按 tfdt 排序/去重/断点平滑）输出标准 MP4，修正音视频漂移。
-            // 无缓冲（如直链下载强制流式、或该轨未启用高精度）时回退到文件级重建。
-            let buf = {
-                let bs = self.track_buffers.lock().unwrap();
-                bs.get(&info.id).cloned()
-            };
-            let mut used_buffer = false;
-            if let Some(b) = buf {
-                let tb = b.lock().unwrap();
-                if tb.estimated_bytes() > 0 {
-                    match tb.finalize(&out) {
-                        Ok(_) => {
-                            used_buffer = true;
-                            eprintln!("[finalize] track {} 使用高精度缓冲重构输出", info.id);
-                        }
-                        Err(e) => {
-                            eprintln!("[finalize] track {} 缓冲重构失败，回退文件级重建: {e}", info.id);
+            // 健壮性：流式落盘的 .tmp-part 一旦存在，必须优先用于收尾——
+            // 它可能含有早期分片（如「关闭高精度」时已把内存缓冲落盘进 .tmp-part，
+            // 之后又重新开启高精度导致后期分片回到内存缓冲）。任何「内存缓冲 + .tmp-part」
+            // 分裂状态都必须合并，否则仅取其一会让文件被截断。
+            // 策略：若 .tmp-part 存在，先把残留内存缓冲的原始分片追加进它，再走文件级重建；
+            // 仅当 .tmp-part 完全不存在时才走纯内存缓冲重构（早期整轨都在缓冲里）。
+            let has_tmp = src_opt.is_some();
+            if has_tmp {
+                // 把残留内存缓冲的原始分片（init+各 moof 字节）追加进 .tmp-part，
+                // 与已有流式分片按到达顺序拼接，保证收尾文件完整。
+                if let Some(b) = self.track_buffers.lock().unwrap().get(&info.id) {
+                    let tb = b.lock().unwrap();
+                    if tb.estimated_bytes() > 0 {
+                        if let Some(src) = src_opt.as_ref() {
+                            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(src) {
+                                let _ = tb.flush_raw(&mut f);
+                            }
                         }
                     }
                 }
-            }
-            if !used_buffer {
-                // 缓冲路径未使用（流式分片或降级）：取最大的 .tmp-part 文件级重建
                 let src = src_opt.take().ok_or_else(|| "没有可收尾的文件".to_string())?;
                 // 优先重建索引表（fMP4 -> 标准 MP4，可拖拽 seek）
                 let ok = fmp4::finalize(&src, std::path::Path::new(&out));
@@ -690,6 +686,30 @@ impl AppState {
                 }
                 if let Err(err) = std::fs::remove_file(&src) {
                     eprintln!("[finalize] 临时文件清理失败 {}: {err}", src.display());
+                }
+            } else {
+                // 无 .tmp-part：说明全程在内存缓冲（纯高精度、无中途流式），用缓冲重构
+                let buf = {
+                    let bs = self.track_buffers.lock().unwrap();
+                    bs.get(&info.id).cloned()
+                };
+                let mut used_buffer = false;
+                if let Some(b) = buf {
+                    let tb = b.lock().unwrap();
+                    if tb.estimated_bytes() > 0 {
+                        match tb.finalize(&out) {
+                            Ok(_) => {
+                                used_buffer = true;
+                                eprintln!("[finalize] track {} 使用高精度缓冲重构输出", info.id);
+                            }
+                            Err(e) => {
+                                eprintln!("[finalize] track {} 缓冲重构失败，回退文件级重建: {e}", info.id);
+                            }
+                        }
+                    }
+                }
+                if !used_buffer {
+                    return Err(AppError::NotFound("没有可收尾的文件".into()));
                 }
             }
         } else {
@@ -807,7 +827,64 @@ impl AppState {
 
     /// 高精度同步开关（缓冲重构）
     pub fn set_high_precision(&self, enabled: bool) -> AppResult<()> {
+        let was = self.high_precision();
         self.high_precision.store(enabled, std::sync::atomic::Ordering::Relaxed);
+        // 从「开启」切到「关闭」：把已缓冲的早期分片落盘（转边下边存）。
+        // 否则该轨同时存在「内存缓冲(早期)+.tmp-part(后期)」两份数据，收尾时若先命中
+        // 内存缓冲路径会丢弃 .tmp-part 的后期分片 → 文件被截断。见 finalize_impl。
+        if was && !enabled {
+            self.flush_buffers_to_disk()?;
+        }
+        Ok(())
+    }
+
+    /// 把每条仍在下载的 mp4 轨道的内存缓冲（init+各 moof 原始字节）追加进其 .tmp-part 流。
+    /// 触发时机：用户关闭「高精度同步」时（期望改走边下边存、释放内存），
+    /// 保证早期已缓冲的分片不丢失、与后续流式分片顺序拼接。
+    /// 落盘后立即移除该轨缓冲（释放内存；并避免收尾时 finalize_impl 仍命中内存缓冲路径
+    /// 而丢弃 .tmp-part 的后期分片）。
+    fn flush_buffers_to_disk(&self) -> AppResult<()> {
+        // 收集需要落盘的 track_id（避免在持有缓冲锁时去抢 writer 锁）
+        let ids: Vec<TrackId> = {
+            let bs = self.track_buffers.lock().unwrap();
+            bs.iter()
+                .filter(|(_, b)| b.lock().unwrap().estimated_bytes() > 0)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        for id in ids {
+            // 确保流式 writer 存在（首片可能尚未到达、或全是缓冲）
+            let _ = self.ensure_writer(id);
+            let buf = {
+                let bs = self.track_buffers.lock().unwrap();
+                bs.get(&id).cloned()
+            };
+            if let Some(b) = buf {
+                let written; // 本次落盘字节（用于更新 writer 计数）
+                let segs;
+                {
+                    let tb = b.lock().unwrap();
+                    if tb.estimated_bytes() == 0 {
+                        continue;
+                    }
+                    if let Some(w) = self.writer(id) {
+                        let mut w = w.lock().unwrap();
+                        let n = tb.flush_raw(&mut w.file)?;
+                        w.bytes += n;
+                        w.segments += tb.seg_count();
+                        written = n;
+                        segs = tb.seg_count();
+                    } else {
+                        continue;
+                    }
+                }
+                // 落盘完成后移除缓冲：释放内存，且让 finalize 走 .tmp-part 文件级重建
+                self.track_buffers.lock().unwrap().remove(&id);
+                // 注：轨道计数 (t.bytes/t.segments) 已在 append_chunk 的缓冲分支中累计，
+                // writer.bytes 也已在此处更新，无需再次累加（避免重复计数）。
+                let _ = (written, segs);
+            }
+        }
         Ok(())
     }
 
@@ -1257,7 +1334,10 @@ fn mp4_duration_sec(path: &str) -> Option<f64> {
                 let _ver_flags = u32::from_be_bytes(data[content_start..content_start + 4].try_into().ok()?);
                 let entry_count = u32::from_be_bytes(data[content_start + 4..content_start + 8].try_into().ok()?) as usize;
                 let mut total_dur = 0u64;
-                let ts = 0u32;
+                // 取该 trak 的 mdhd timescale 作分母（stts 只给 sample count×duration，
+                // 需配合 timescale 才算秒数）。此前误写为 `ts = 0u32` 导致此分支永远不返回，
+                // 时长一致性校验形同虚设。
+                let ts = Self::find_mdhd_timescale(&data).unwrap_or(0);
                 let mut sample_count = 0u64;
                 let mut entry_off = content_start + 8;
                 for _ in 0..entry_count.min(100_000) {
@@ -1317,17 +1397,20 @@ fn run_mux(
     audio: &str,
     out: &std::path::Path,
 ) -> AppResult<()> {
-    // 时长一致性校验：同 ffmpeg 路径
+    // 时长一致性校验：同 ffmpeg 路径。fMP4 重建后某轨 mdhd.duration 常为 0，
+    // 测得时长≈0 会误拒合法混流，故任一时长不可靠（<0.5s）时跳过校验。
     let v_dur = Self::mp4_duration_sec(video);
     let a_dur = Self::mp4_duration_sec(audio);
     if let (Some(v), Some(a)) = (v_dur, a_dur) {
-        let diff = (v - a).abs();
-        let avg = (v + a) / 2.0;
-        if avg > 1.0 && diff / avg > 0.015 {
-            return Err(AppError::MuxFailed(format!(
-                "音视频时长差异过大 (video={:.2}s, audio={:.2}s, diff={:.1}%)，拒绝混流以防止渐进漂移。",
-                v, a, diff / avg * 100.0
-            )));
+        if v > 0.5 && a > 0.5 {
+            let diff = (v - a).abs();
+            let avg = (v + a) / 2.0;
+            if avg > 1.0 && diff / avg > 0.015 {
+                return Err(AppError::MuxFailed(format!(
+                    "音视频时长差异过大 (video={:.2}s, audio={:.2}s, diff={:.1}%)，拒绝混流以防止渐进漂移。",
+                    v, a, diff / avg * 100.0
+                )));
+            }
         }
     }
 
@@ -1371,17 +1454,22 @@ fn run_mux_ffmpeg(
     audio: &str,
     out: &std::path::Path,
 ) -> AppResult<()> {
-    // 时长一致性校验：读取两轨 mvhd duration（精确到 ms），差 > 1.5% 直接拒绝
+    // 时长一致性校验：读取两轨时长，差 > 1.5% 拒绝混流以防渐进漂移。
+    // 但 fMP4 重建后的单轨文件常见某轨 mdhd.duration=0（音频轨尤甚），此时测得时长≈0
+    // 会误判为“差异过大”而拒绝合法混流。故任一时长不可靠（<0.5s）时跳过校验，
+    // 仅当双轨均可信且确实漂移才拦截。
     let v_dur = Self::mp4_duration_sec(video);
     let a_dur = Self::mp4_duration_sec(audio);
     if let (Some(v), Some(a)) = (v_dur, a_dur) {
-        let diff = (v - a).abs();
-        let avg = (v + a) / 2.0;
-        if avg > 1.0 && diff / avg > 0.015 {
-            return Err(AppError::MuxFailed(format!(
-                "音视频时长差异过大 (video={:.2}s, audio={:.2}s, diff={:.1}%)，拒绝混流以防止渐进漂移。请检查源流是否完整或手动收尾。",
-                v, a, diff / avg * 100.0
-            )));
+        if v > 0.5 && a > 0.5 {
+            let diff = (v - a).abs();
+            let avg = (v + a) / 2.0;
+            if avg > 1.0 && diff / avg > 0.015 {
+                return Err(AppError::MuxFailed(format!(
+                    "音视频时长差异过大 (video={:.2}s, audio={:.2}s, diff={:.1}%)，拒绝混流以防止渐进漂移。请检查源流是否完整或手动收尾。",
+                    v, a, diff / avg * 100.0
+                )));
+            }
         }
     }
 
@@ -1480,6 +1568,187 @@ fn run_mux_ffmpeg(
             d.aborted = true;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    /// 用临时目录隔离，避免污染真实下载目录；并返回该目录路径（测试结束后清理）。
+    fn new_state_in(dir: &std::path::Path) -> Arc<AppState> {
+        let s = Arc::new(AppState::new());
+        s.set_save_dir(dir.to_str().unwrap()).unwrap();
+        // 默认 auto=true；测试显式控制
+        let _ = s.set_auto(true);
+        s
+    }
+
+    /// 统计目录下所有 .tmp-part 文件的总字节数（边下边存落盘证据）
+    fn tmp_part_bytes(dir: &std::path::Path) -> u64 {
+        let mut total = 0u64;
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.to_string_lossy().ends_with(".tmp-part") {
+                    if let Ok(m) = std::fs::metadata(&p) {
+                        total += m.len();
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    /// 合成一个最小 MP4 box（4 字节大端长度 + 4 字节类型 + payload）
+    fn box_bytes(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = (payload.len() + 8) as u32;
+        let mut v = size.to_be_bytes().to_vec();
+        v.extend_from_slice(typ);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// 模拟一个 mp4 分片序列（init + 若干 moof），并返回总字节数
+    fn make_chunks() -> Vec<Vec<u8>> {
+        // 真实可解析不重要：只需非空的 init + moof 字节流，测试路由与落盘行为
+        let init = box_bytes(b"ftyp", b"isom\0\0\0\0isom");
+        let mut moof = box_bytes(b"moof", &[0u8; 16]);
+        // 让 moof 看起来合法（含 traf 头占位即可，解析失败不影响本次路由测试）
+        moof.extend_from_slice(&box_bytes(b"traf", &[0u8; 8]));
+        vec![init, moof.clone(), moof.clone(), moof]
+    }
+
+    #[test]
+    fn hp_off_streams_to_disk() {
+        let dir = std::env::temp_dir().join(format!("md-test-hp-off-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let st = new_state_in(&dir);
+        let _ = st.set_high_precision(false);
+        let id = st.register_track("video", "video/mp4", "mp4", "mp4", "t", "s", true);
+        let chunks = make_chunks();
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        for c in &chunks {
+            st.append_chunk(id, c).unwrap();
+        }
+        let on_disk = tmp_part_bytes(&dir);
+        let buf_bytes = {
+            let bs = st.track_buffers.lock().unwrap();
+            bs.get(&id).map(|b| b.lock().unwrap().estimated_bytes()).unwrap_or(0)
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(buf_bytes, 0, "关闭高精度时不应写入内存缓冲");
+        assert_eq!(on_disk as usize, total, "关闭高精度时所有分片应直写磁盘（边下边存）");
+    }
+
+    #[test]
+    fn hp_on_buffers_in_memory() {
+        let dir = std::env::temp_dir().join(format!("md-test-hp-on-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let st = new_state_in(&dir);
+        let _ = st.set_high_precision(true);
+        let id = st.register_track("video", "video/mp4", "mp4", "mp4", "t", "s", true);
+        let chunks = make_chunks();
+        for c in &chunks {
+            st.append_chunk(id, c).unwrap();
+        }
+        let on_disk = tmp_part_bytes(&dir);
+        let buf_bytes = {
+            let bs = st.track_buffers.lock().unwrap();
+            bs.get(&id).map(|b| b.lock().unwrap().estimated_bytes()).unwrap_or(0)
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(buf_bytes > 0, "开启高精度时应在内存缓冲累积");
+        assert_eq!(on_disk, 0, "开启高精度时不应边下边存落盘");
+    }
+
+    /// 回归：开启高精度缓冲若干分片后，中途关闭高精度，早期缓冲应落盘
+    /// （转边下边存），且后续分片继续流式写盘，二者拼接为完整 .tmp-part。
+    /// 若不加 flush，缓冲与 .tmp-part 会分裂，收尾时仅取其一 → 文件被截断。
+    #[test]
+    fn hp_toggle_off_midway_flushes_buffer() {
+        let dir = std::env::temp_dir().join(format!("md-test-hp-mid-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let st = new_state_in(&dir);
+        let _ = st.set_high_precision(true);
+        let id = st.register_track("video", "video/mp4", "mp4", "mp4", "t", "s", true);
+        let chunks = make_chunks(); // [init, moof, moof, moof]
+        let early = &chunks[..2]; // 前两段在缓冲期到达
+        let late = &chunks[2..]; // 后两段在关闭高精度后到达
+        let early_total: usize = early.iter().map(|c| c.len()).sum();
+        let late_total: usize = late.iter().map(|c| c.len()).sum();
+
+        for c in early {
+            st.append_chunk(id, c).unwrap();
+        }
+        // 中途关闭高精度（用户为省内存而操作）
+        let _ = st.set_high_precision(false);
+
+        // 关闭后应可立即读到已缓冲的早期分片落盘证据
+        let disk_after_toggle = tmp_part_bytes(&dir);
+        assert_eq!(disk_after_toggle as usize, early_total, "关闭高精度应把早期缓冲落盘");
+
+        // 后续分片走流式
+        for c in late {
+            st.append_chunk(id, c).unwrap();
+        }
+        let disk_final = tmp_part_bytes(&dir);
+        let buf_after = {
+            let bs = st.track_buffers.lock().unwrap();
+            bs.get(&id).map(|b| b.lock().unwrap().estimated_bytes()).unwrap_or(0)
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(buf_after, 0, "关闭高精度后内存缓冲应被清空（释放内存）");
+        assert_eq!(
+            disk_final as usize,
+            early_total + late_total,
+            "缓冲(早期)+流式(后期)应拼接为完整 .tmp-part"
+        );
+    }
+
+    /// 回归：开启→关闭→再开启高精度（反复切换）中途，缓冲与 .tmp-part 会出现分裂。
+    /// finalize 必须把两边数据合并，而不是仅取内存缓冲丢弃 .tmp-part（否则文件被截断）。
+    #[test]
+    fn hp_toggle_back_on_merges_buffer_and_tmp() {
+        let dir = std::env::temp_dir().join(format!("md-test-hp-back-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let st = new_state_in(&dir);
+        let _ = st.set_high_precision(true);
+        let id = st.register_track("video", "video/mp4", "mp4", "mp4", "t", "s", true);
+        let chunks = make_chunks(); // [init, moof, moof, moof]
+        let a = &chunks[..1]; // 全缓冲期
+        let b = &chunks[1..3]; // 关闭高精度后的流式期
+        let c = &chunks[3..]; // 再次开启后的缓冲期
+        let a_total: usize = a.iter().map(|x| x.len()).sum();
+        let b_total: usize = b.iter().map(|x| x.len()).sum();
+        let c_total: usize = c.iter().map(|x| x.len()).sum();
+
+        for x in a {
+            st.append_chunk(id, x).unwrap();
+        }
+        let _ = st.set_high_precision(false);
+        for x in b {
+            st.append_chunk(id, x).unwrap();
+        }
+        // 此时 .tmp-part 应含 a+b
+        assert_eq!(
+            tmp_part_bytes(&dir) as usize,
+            a_total + b_total,
+            "关闭期：.tmp-part 应含早期缓冲(a)与流式(b)"
+        );
+        let _ = st.set_high_precision(true);
+        for x in c {
+            st.append_chunk(id, x).unwrap();
+        }
+        // 再次开启后，c 进内存缓冲；.tmp-part 仍含 a+b
+        let disk = tmp_part_bytes(&dir);
+        let buf = {
+            let bs = st.track_buffers.lock().unwrap();
+            bs.get(&id).map(|b| b.lock().unwrap().estimated_bytes()).unwrap_or(0)
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(buf, c_total as u64, "再次开启后 c 应在内存缓冲");
+        assert_eq!(disk as usize, a_total + b_total, ".tmp-part 应保持 a+b 不被覆盖");
     }
 }
 

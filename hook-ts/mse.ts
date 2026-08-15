@@ -24,7 +24,10 @@ export interface MSEntry {
 }
 
 const sbMap = new WeakMap<SourceBuffer, MSEntry>(); // SourceBuffer -> entry（每条轨道独立）
-let msEntries: MSEntry[] = [];                      // 所有已注册 entry（endOfStream 时按 MediaSource 逐个通知）
+// 用 WeakMap 持有「MediaSource -> 其下所有轨道 entry」，键对 MediaSource 弱引用。
+// 站点放弃 MediaSource（SPA 跳转、直播未调 endOfStream、中途切流重建）后该对象可被 GC，
+// 连带 entry.pending（最多 64MB 缓冲）一起回收，避免 msEntries 强数组无限增长导致 WebView2 内存泄漏。
+const msEntriesMap = new WeakMap<MediaSource, MSEntry[]>(); // MediaSource -> 其下 entry 列表
 
 // 会话 ID：同一 MediaSource 的 音/视频 SourceBuffer 打进同一播放会话。
 // 混流配对的主键由此而来 —— 比 document.title 可靠（SPA/动态标题不会错配）。
@@ -81,7 +84,9 @@ export function patchMSE(): void {
       session: sessionOf(this),
     };
     sbMap.set(sb, entry);
-    msEntries.push(entry);
+    let arr = msEntriesMap.get(this);
+    if (!arr) { arr = []; msEntriesMap.set(this, arr); }
+    arr.push(entry);
     wrapSB(sb, entry);
     return sb;
   };
@@ -90,18 +95,22 @@ export function patchMSE(): void {
   MS.prototype.endOfStream = function (): void {
     const r = nativeEOS.apply(this, arguments as any);
     if (rt.cfg) {
-      // 通知该 MediaSource 下所有轨道结束（视频 + 音频各自一条）
-      for (let k = 0; k < msEntries.length; k++) {
-        const entry = msEntries[k];
-        if (entry.ms === this && !entry.ended) {
-          entry.ended = true;
-          if (entry.trackId != null) {
-            post("/seg/" + rt.cfg.token + "/" + entry.trackId + "/end", new Uint8Array(0));
+      // 通知该 MediaSource 下所有轨道结束（视频 + 音频各自一条）。
+      // entry 列表从 WeakMap 取；站点若已放弃该 MediaSource，GC 后列表自动消失，无需手动删除（避免强引用泄漏）。
+      const arr = msEntriesMap.get(this);
+      if (arr) {
+        for (let k = 0; k < arr.length; k++) {
+          const entry = arr[k];
+          if (!entry.ended) {
+            entry.ended = true;
+            if (entry.trackId != null) {
+              post("/seg/" + rt.cfg.token + "/" + entry.trackId + "/end", new Uint8Array(0));
+            }
           }
         }
+        // 不清空数组：保留 ended 标记，便于 end-of-stream 后仍有 append 的补帧也能正确跳过；
+        // 真正的回收交给 GC（WeakMap 键随 MediaSource 死亡而回收）。
       }
-      const self = this;
-      msEntries = msEntries.filter(function (e) { return e.ms !== self; });
     }
     return r;
   };

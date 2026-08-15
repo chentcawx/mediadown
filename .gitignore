@@ -1,23 +1,21 @@
-# --- Rust / Cargo build artifacts ---
-/target
-**/target
+# 构建产物
+/target/
+**/target/
 
-# --- Node / npm ---
-node_modules/
-npm-debug.log*
-yarn-error.log*
-
-# --- Tauri / bundled binaries (user-provided tools & output) ---
+# 32 位绿色分发版（含 ffmpeg 等大二进制，单独打包，不进版本库）
+/MedAnyDown-x86/
+/MediaDown-x86/
 *.exe
-*.dll
-*.pdb
-downloads/
-tools/
 
-# --- OS / editor ---
-Thumbs.db
+# 混流工具二进制（由 scripts/bundle_tools.ps1 从本地 tools/ 或 MD_FFMPEG 复制）
+/tools/*.exe
+/tools/*.dll
+
+# 依赖
+/node_modules/
+
+# 日志 / 临时
+*.log
+*.db
 .DS_Store
-.idea/
-.vscode/
-*.swp
-*.swo
+Thumbs.db
